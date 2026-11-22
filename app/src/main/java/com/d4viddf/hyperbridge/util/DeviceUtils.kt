@@ -37,11 +37,11 @@ object DeviceUtils {
 
         // 2. HyperOS 3 on Android 15 (API 35)
         val version = getSystemProperty("ro.mi.os.version.name")
-        return version.startsWith("OS3", ignoreCase = true)
+        return version.startsWith("OS3", ignoreCase = true) || version.startsWith("OS2", ignoreCase = true)
     }
 
     val isCNRom: Boolean
-        get() {
+        get() { 
             val region = getSystemProperty("ro.miui.region")
             if (region.equals("CN", ignoreCase = true)) return true
             return Build.DISPLAY.contains("CNXM", ignoreCase = true)
