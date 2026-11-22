@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="island_test_label" translatable="false">Island Test</string>
+    <string name="island_a11y_label" translatable="false">HyperBridge Island</string>
+    <string name="island_a11y_description" translatable="false">Draws a HyperOS-style island around the front camera. It only draws on screen; it does not read, collect or send what is on your screen.</string>
+</resources>

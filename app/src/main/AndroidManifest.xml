@@ -126,6 +126,32 @@
                 android:resource="@xml/file_paths" />
         </provider>
 
+        <!-- Self-drawn island (Phase 1 test) -->
+        <activity
+            android:name=".island.IslandTestActivity"
+            android:exported="true"
+            android:label="@string/island_test_label"
+            android:taskAffinity="com.d4viddf.hyperbridge.islandtest"
+            android:theme="@style/Theme.HyperBridge">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".island.IslandAccessibilityService"
+            android:exported="true"
+            android:label="@string/island_a11y_label"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/island_accessibility_service" />
+        </service>
+
         <!-- Required by Shizuku API -->
         <meta-data
             android:name="moe.shizuku.privileged.api_version"
