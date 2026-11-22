@@ -1,15 +1,10 @@
 package com.d4viddf.hyperbridge.island
 
-import androidx.compose.animation.AnimatedContent
-import androidx.compose.animation.SizeTransform
-import androidx.compose.animation.core.animateDpAsState
-import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.AnimationSpec
+import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.scaleIn
-import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -20,10 +15,11 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.requiredSize
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.wrapContentSize
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -38,39 +34,41 @@ import androidx.compose.material.icons.rounded.SkipPrevious
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.BlurEffect
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.TileMode
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.layout.layout
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlin.math.abs
+import kotlin.math.roundToInt
+import kotlin.math.sign
 
-/**
- * Measured from the HyperOS 3 reference videos (see hyperisland-ref/SPEC.md).
- * Ratios are relative to the screen width so the island scales per device.
- */
+/** Colours of the island (sizes live in IslandLayout). */
 object IslandSpec {
-    const val PILL_HEIGHT_RATIO = 0.083f      // compact pill height / screen width
-    const val COMPACT_WIDTH_RATIO = 0.347f    // compact (call / timer) pill width
-    const val WIDE_WIDTH_RATIO = 0.53f        // wide (charging) pill width
-    const val CARD_MARGIN_RATIO = 0.044f      // side margin of expanded cards
-    const val CARD_RADIUS_RATIO = 0.055f      // corner radius of expanded cards
-    const val CALL_HEIGHT_RATIO = 0.22f       // expanded call card height
-    const val MUSIC_HEIGHT_RATIO = 0.42f      // expanded music card height
-
-    const val SPRING_DAMPING = 0.78f          // slight overshoot (~1-2%) as in the video
-    const val SPRING_STIFFNESS = 380f         // ~220-260 ms to settle on expand
-
     val Fill = Color(0xFF000000)
     val TextPrimary = Color(0xFFFFFFFF)
     val TextSecondary = Color(0xFF8E8E93)
@@ -81,55 +79,192 @@ object IslandSpec {
     val MusicGreen = Color(0xFF1DB954)
 }
 
-private data class IslandRect(val left: Dp, val top: Dp, val width: Dp, val height: Dp, val radius: Dp)
+// Motion, fitted frame-by-frame to the HyperOS 3 promo (25 fps):
+// grow ~5 frames (~200 ms) + 1-3% overshoot; width leads height slightly (iOS-like).
+private val GROW_W: AnimationSpec<Float> = spring(dampingRatio = 0.74f, stiffness = 540f)
+private val GROW_H: AnimationSpec<Float> = spring(dampingRatio = 0.80f, stiffness = 420f)
+private val GROW_POS: AnimationSpec<Float> = spring(dampingRatio = 0.82f, stiffness = 460f)
+// Shrink-then-grow switch: a quick, non-bouncy contraction toward the camera (~3 frames).
+private val CONTRACT: AnimationSpec<Float> = spring(dampingRatio = 1f, stiffness = 1100f)
+// Dismiss: springs back into the camera without overshoot.
+private val SHRINK: AnimationSpec<Float> = spring(dampingRatio = 1f, stiffness = 620f)
+private val DRAG_BACK: AnimationSpec<Float> = spring(dampingRatio = 0.62f, stiffness = 520f)
+
+/** All animated values of the single morphing shape, in px. */
+private class IslandAnim(start: IslandRectPx, private val blurPx: Float) {
+    val cx = Animatable(start.cx)
+    val top = Animatable(start.top)
+    val w = Animatable(start.w)
+    val h = Animatable(start.h)
+    val r = Animatable(start.r)
+    val shapeAlpha = Animatable(0f)
+    val contentAlpha = Animatable(0f)
+    val contentScale = Animatable(1f)
+    val contentBlur = Animatable(0f)
+    val dragX = Animatable(0f)
+
+    suspend fun snapShape(t: IslandRectPx) {
+        cx.snapTo(t.cx)
+        top.snapTo(t.top)
+        w.snapTo(t.w)
+        h.snapTo(t.h)
+        r.snapTo(t.r)
+    }
+
+    suspend fun animateShape(
+        t: IslandRectPx,
+        wSpec: AnimationSpec<Float>,
+        hSpec: AnimationSpec<Float>,
+        posSpec: AnimationSpec<Float>
+    ) {
+        coroutineScope {
+            launch { cx.animateTo(t.cx, posSpec) }
+            launch { top.animateTo(t.top, posSpec) }
+            launch { w.animateTo(t.w, wSpec) }
+            launch { h.animateTo(t.h, hSpec) }
+            launch { r.animateTo(t.r, posSpec) }
+        }
+    }
+
+    suspend fun contentOut() {
+        coroutineScope {
+            launch { contentAlpha.animateTo(0f, tween(80, easing = LinearEasing)) }
+            launch { contentBlur.animateTo(blurPx, tween(80)) }
+        }
+    }
+}
+
+/** Finger follows with resistance: never more than [limit] px away. */
+private fun rubberBand(dx: Float, limit: Float): Float {
+    if (limit <= 0f) return 0f
+    val a = abs(dx)
+    return sign(dx) * limit * (1f - 1f / (a * 0.6f / limit + 1f))
+}
 
 @Composable
-fun IslandOverlay(geometry: IslandGeometry, mode: IslandMode) {
+fun IslandOverlay(geometry: IslandGeometry, mode: IslandMode, calibration: IslandCalibration) {
     val density = LocalDensity.current
-    val screenW = with(density) { geometry.screenWidthPx.toDp() }
-    val camX = with(density) { geometry.cameraCenterXPx.toDp() }
-    val camY = with(density) { geometry.cameraCenterYPx.toDp() }
-    val camD = with(density) { geometry.cameraDiameterPx.toDp() }
-    val statusBar = with(density) { geometry.statusBarHeightPx.toDp() }
+    val d = density.density
+    val blurPx = with(density) { 6.dp.toPx() }
 
-    val pillH = maxOf(screenW * IslandSpec.PILL_HEIGHT_RATIO, camD + 8.dp)
+    val latestGeometry by rememberUpdatedState(geometry)
+    val latestCalibration by rememberUpdatedState(calibration)
+    val currentMode by rememberUpdatedState(mode)
 
-    fun pill(width: Dp): IslandRect =
-        IslandRect(camX - width / 2, camY - pillH / 2, width, pillH, pillH / 2)
+    fun targetOf(m: IslandMode): IslandRectPx = IslandLayout.target(m, latestGeometry, latestCalibration, d)
 
-    fun card(height: Dp): IslandRect {
-        val margin = screenW * IslandSpec.CARD_MARGIN_RATIO
-        val top = maxOf(statusBar, camY + camD / 2) + 6.dp
-        return IslandRect(margin, top, screenW - margin * 2, height, screenW * IslandSpec.CARD_RADIUS_RATIO)
-    }
+    val anim = remember { IslandAnim(IslandLayout.camera(geometry, calibration, d), blurPx) }
+    var displayedMode by remember { mutableStateOf(IslandMode.HIDDEN) }
+    var transitioning by remember { mutableStateOf(false) }
 
-    val target = when (mode) {
-        IslandMode.HIDDEN -> {
-            val d = camD + 2.dp
-            IslandRect(camX - d / 2, camY - d / 2, d, d, d / 2)
+    // 1) Mode transitions: grow out of the camera, shrink-then-grow switches, shrink back into the camera.
+    LaunchedEffect(mode) {
+        transitioning = true
+        val from = displayedMode
+        if (mode == IslandMode.HIDDEN) {
+            if (from != IslandMode.HIDDEN && anim.shapeAlpha.value > 0f) {
+                anim.contentOut()
+                val cam = targetOf(IslandMode.HIDDEN)
+                coroutineScope {
+                    launch { anim.dragX.animateTo(0f, SHRINK) }
+                    launch { anim.animateShape(cam, SHRINK, SHRINK, SHRINK) }
+                    launch {
+                        // Only disappear once the shape is (almost) back inside the camera hole.
+                        snapshotFlow { anim.w.value }.first { it <= cam.w * 1.25f + 1f }
+                        anim.shapeAlpha.animateTo(0f, tween(90))
+                    }
+                }
+            }
+            anim.shapeAlpha.snapTo(0f)
+            anim.contentAlpha.snapTo(0f)
+            displayedMode = IslandMode.HIDDEN
+        } else {
+            if (from == IslandMode.HIDDEN || anim.shapeAlpha.value < 0.05f) {
+                // Start as a camera-sized black dot sitting on the camera.
+                anim.snapShape(targetOf(IslandMode.HIDDEN))
+                anim.dragX.snapTo(0f)
+                anim.contentAlpha.snapTo(0f)
+                anim.shapeAlpha.snapTo(1f)
+            } else if (from != mode) {
+                // Switch: content out, contract toward the camera, then grow into the new shape.
+                anim.contentOut()
+                coroutineScope {
+                    launch { anim.dragX.animateTo(0f, SHRINK) }
+                    anim.animateShape(
+                        IslandLayout.contracted(latestGeometry, latestCalibration, d),
+                        CONTRACT, CONTRACT, CONTRACT
+                    )
+                }
+                anim.shapeAlpha.snapTo(1f)
+            }
+            displayedMode = mode
+            anim.contentScale.snapTo(0.9f)
+            anim.contentBlur.snapTo(blurPx)
+            val tgt = targetOf(mode)
+            coroutineScope {
+                launch { anim.animateShape(tgt, GROW_W, GROW_H, GROW_POS) }
+                launch {
+                    // Content appears only once the shape is ~70% grown.
+                    val useH = abs(tgt.h - anim.h.value) > abs(tgt.w - anim.w.value)
+                    val start = if (useH) anim.h.value else anim.w.value
+                    val end = if (useH) tgt.h else tgt.w
+                    if (abs(end - start) > 1f) {
+                        withTimeoutOrNull(450) {
+                            snapshotFlow { if (useH) anim.h.value else anim.w.value }
+                                .first { (it - start) / (end - start) >= 0.7f }
+                        }
+                    }
+                    coroutineScope {
+                        launch { anim.contentAlpha.animateTo(1f, tween(160)) }
+                        launch { anim.contentBlur.animateTo(0f, tween(180)) }
+                        launch { anim.contentScale.animateTo(1f, spring(dampingRatio = 0.8f, stiffness = 420f)) }
+                    }
+                }
+            }
         }
-        IslandMode.COMPACT -> pill(screenW * IslandSpec.COMPACT_WIDTH_RATIO)
-        IslandMode.WIDE -> pill(screenW * IslandSpec.WIDE_WIDTH_RATIO)
-        IslandMode.EXPANDED -> card(screenW * IslandSpec.CALL_HEIGHT_RATIO)
-        IslandMode.MUSIC -> card(screenW * IslandSpec.MUSIC_HEIGHT_RATIO)
+        transitioning = false
     }
 
-    val dpSpring = spring<Dp>(
-        dampingRatio = IslandSpec.SPRING_DAMPING,
-        stiffness = IslandSpec.SPRING_STIFFNESS
-    )
-    val left by animateDpAsState(target.left, dpSpring, label = "islandLeft")
-    val top by animateDpAsState(target.top, dpSpring, label = "islandTop")
-    val width by animateDpAsState(target.width, dpSpring, label = "islandWidth")
-    val height by animateDpAsState(target.height, dpSpring, label = "islandHeight")
-    val radius by animateDpAsState(target.radius, dpSpring, label = "islandRadius")
-    val islandAlpha by animateFloatAsState(
-        targetValue = if (mode == IslandMode.HIDDEN) 0f else 1f,
-        animationSpec = if (mode == IslandMode.HIDDEN) tween<Float>(220, delayMillis = 60) else tween<Float>(120),
-        label = "islandAlpha"
-    )
+    // 2) Live calibration: when sizes/offsets change while the island is settled, follow immediately.
+    val liveTarget = IslandLayout.target(mode, geometry, calibration, d)
+    LaunchedEffect(liveTarget) {
+        if (!transitioning && displayedMode == mode && mode != IslandMode.HIDDEN) {
+            anim.snapShape(liveTarget)
+        }
+    }
 
-    // Shared mock clocks so the timer keeps running across compact <-> expanded.
+    // 3) Swipe left/right to dismiss (events come from the small touch window).
+    LaunchedEffect(Unit) {
+        IslandController.drag.collect { ev ->
+            val screenW = latestGeometry.screenWidthPx.toFloat()
+            when (ev) {
+                is IslandDrag.Move -> {
+                    if (currentMode != IslandMode.HIDDEN) {
+                        anim.dragX.snapTo(rubberBand(ev.totalDx, screenW * 0.22f))
+                    }
+                }
+                is IslandDrag.End -> {
+                    if (currentMode != IslandMode.HIDDEN) {
+                        val far = abs(ev.totalDx) > screenW * 0.16f
+                        val fling = abs(ev.velocityX) > 900f &&
+                                (ev.totalDx == 0f || sign(ev.velocityX) == sign(ev.totalDx))
+                        if (far || fling) {
+                            IslandController.show(IslandMode.HIDDEN)
+                        } else {
+                            launch { anim.dragX.animateTo(0f, DRAG_BACK) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Content is laid out once at its final size and revealed by the morphing clip (no reflow per frame).
+    val contentRect = IslandLayout.target(displayedMode, geometry, calibration, d)
+    val contentW = with(density) { contentRect.w.toDp() }
+    val contentH = with(density) { contentRect.h.toDp() }
+
+    // Shared mock clock so the timer keeps running across compact <-> expanded.
     val callSeconds by produceState(initialValue = 5) {
         while (true) {
             delay(1000)
@@ -139,25 +274,38 @@ fun IslandOverlay(geometry: IslandGeometry, mode: IslandMode) {
 
     Box(Modifier.fillMaxSize()) {
         Box(
-            modifier = Modifier
-                .offset(x = left, y = top)
-                .size(width = maxOf(width, 0.dp), height = maxOf(height, 0.dp))
-                .graphicsLayer { alpha = islandAlpha }
-                .clip(RoundedCornerShape(maxOf(radius, 0.dp)))
+            Modifier
+                .layout { measurable, _ ->
+                    val wPx = anim.w.value.coerceAtLeast(0f).roundToInt()
+                    val hPx = anim.h.value.coerceAtLeast(0f).roundToInt()
+                    val placeable = measurable.measure(Constraints.fixed(wPx, hPx))
+                    layout(wPx, hPx) { placeable.place(0, 0) }
+                }
+                .graphicsLayer {
+                    val w = anim.w.value.coerceAtLeast(0f)
+                    val h = anim.h.value.coerceAtLeast(0f)
+                    translationX = anim.cx.value + anim.dragX.value - w / 2f
+                    translationY = anim.top.value
+                    alpha = anim.shapeAlpha.value
+                    shape = RoundedCornerShape(anim.r.value.coerceIn(0f, minOf(w, h) / 2f))
+                    clip = true
+                }
                 .background(IslandSpec.Fill)
         ) {
-            AnimatedContent(
-                targetState = mode,
-                modifier = Modifier.fillMaxSize(),
-                transitionSpec = {
-                    (fadeIn(tween(180, delayMillis = 90)) +
-                            scaleIn(initialScale = 0.92f, animationSpec = tween(240, delayMillis = 60)))
-                        .togetherWith(fadeOut(tween(90)))
-                        .using(SizeTransform(clip = false))
-                },
-                label = "islandContent"
-            ) { m ->
-                when (m) {
+            Box(
+                Modifier
+                    .wrapContentSize(align = Alignment.Center, unbounded = true)
+                    .requiredSize(contentW, contentH)
+                    .graphicsLayer {
+                        alpha = anim.contentAlpha.value
+                        val s = anim.contentScale.value
+                        scaleX = s
+                        scaleY = s
+                        val b = anim.contentBlur.value
+                        renderEffect = if (b > 0.5f) BlurEffect(b, b, TileMode.Decal) else null
+                    }
+            ) {
+                when (displayedMode) {
                     IslandMode.HIDDEN -> Box(Modifier.fillMaxSize())
                     IslandMode.COMPACT -> CompactCallContent(formatClock(callSeconds))
                     IslandMode.WIDE -> WideChargingContent()

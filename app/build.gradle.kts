@@ -20,10 +20,28 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    // Shared, debug-only signing key for the OS2 test builds (publicly known password, nothing secret),
+    // so every CI build is signed the same way and installs over the previous one.
+    val sharedDebugKeystoreB64 = project.file("debug-keystore.b64")
+    if (sharedDebugKeystoreB64.exists()) {
+        val sharedDebugKeystore = project.layout.buildDirectory.file("shared-debug.keystore").get().asFile
+        sharedDebugKeystore.parentFile.mkdirs()
+        sharedDebugKeystore.writeBytes(java.util.Base64.getMimeDecoder().decode(sharedDebugKeystoreB64.readText()))
+        signingConfigs {
+            getByName("debug") {
+                storeFile = sharedDebugKeystore
+                storePassword = "android"
+                keyAlias = "androiddebugkey"
+                keyPassword = "android"
+            }
+        }
+    }
+
     buildTypes {
         debug {
             applicationIdSuffix = ".os2test"
             versionNameSuffix = "-os2test"
+            signingConfig = signingConfigs.getByName("debug")
         }
         release {
             isMinifyEnabled = true
