@@ -27,7 +27,10 @@ import androidx.savedstate.SavedStateRegistry
 import androidx.savedstate.SavedStateRegistryController
 import androidx.savedstate.SavedStateRegistryOwner
 import androidx.savedstate.setViewTreeSavedStateRegistryOwner
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
@@ -105,6 +108,12 @@ class IslandAccessibilityService : AccessibilityService(), LifecycleOwner, ViewM
     }
 
     override fun onDestroy() {
+        // Never leave status bar icons hidden by the Shizuku test.
+        if (IslandStatusBar.modified) {
+            CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+                IslandStatusBar.run(IslandStatusBar.CMD_RESTORE)
+            }
+        }
         touchJob?.cancel()
         touchJob = null
         removeTouchWindow()

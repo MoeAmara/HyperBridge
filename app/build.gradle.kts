@@ -1,3 +1,5 @@
+import java.util.Base64
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
@@ -26,7 +28,7 @@ android {
     if (sharedDebugKeystoreB64.exists()) {
         val sharedDebugKeystore = project.layout.buildDirectory.file("shared-debug.keystore").get().asFile
         sharedDebugKeystore.parentFile.mkdirs()
-        sharedDebugKeystore.writeBytes(java.util.Base64.getMimeDecoder().decode(sharedDebugKeystoreB64.readText()))
+        sharedDebugKeystore.writeBytes(Base64.getMimeDecoder().decode(sharedDebugKeystoreB64.readText()))
         signingConfigs {
             getByName("debug") {
                 storeFile = sharedDebugKeystore

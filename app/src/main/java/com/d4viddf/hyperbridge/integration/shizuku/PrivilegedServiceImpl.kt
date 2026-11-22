@@ -44,6 +44,23 @@ class PrivilegedServiceImpl : IPrivilegedService.Stub() {
         logD("Log callback set: ${callback != null}")
     }
 
+    /** Island test build: runs a shell command as the Shizuku user (shell uid) and returns exit code + output. */
+    override fun runShellCommand(command: String?): String {
+        if (command.isNullOrBlank()) return "error: empty command"
+        return try {
+            val process = ProcessBuilder("sh", "-c", command).redirectErrorStream(true).start()
+            val output = process.inputStream.bufferedReader().use { it.readText() }
+            val finished = process.waitFor(5, TimeUnit.SECONDS)
+            val code = if (finished) process.exitValue() else {
+                process.destroy()
+                -1
+            }
+            "exit=$code\n${output.trim()}"
+        } catch (e: Exception) {
+            "error: ${e.javaClass.simpleName}: ${e.message}"
+        }
+    }
+
     override fun setPackageNetworkingEnabled(uid: Int, enabled: Boolean): Boolean {
         logD("🚀 ENTRY: setPackageNetworkingEnabled(uid=$uid, enabled=$enabled)")
         

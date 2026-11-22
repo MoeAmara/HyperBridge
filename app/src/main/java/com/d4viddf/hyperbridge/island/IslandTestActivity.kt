@@ -30,13 +30,20 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.d4viddf.hyperbridge.ui.theme.HyperBridgeTheme
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
 
 /** Test screen: drives the self-drawn island with mock states and lets the user calibrate it. */
@@ -161,6 +168,9 @@ private fun IslandTestScreen(
         )
 
         Spacer(Modifier.height(12.dp))
+        StatusBarTestSection()
+
+        Spacer(Modifier.height(12.dp))
         Text("Setup", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
         OutlinedButton(onClick = onOpenAccessibility, modifier = Modifier.fillMaxWidth()) {
             Text("1. Accessibility settings")
@@ -281,6 +291,75 @@ private fun CalRow(
                 modifier = Modifier.size(44.dp)
             ) { Text("+") }
         }
+    }
+}
+
+@Composable
+private fun StatusBarTestSection() {
+    var shizuku by remember { mutableStateOf(IslandStatusBar.ShizukuState.NOT_RUNNING) }
+    var output by remember { mutableStateOf("") }
+    var busy by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+
+    LaunchedEffect(Unit) {
+        while (true) {
+            shizuku = IslandStatusBar.state()
+            delay(1500)
+        }
+    }
+
+    fun runCommand(command: String) {
+        if (busy) return
+        busy = true
+        output = "Running: $command"
+        scope.launch {
+            val result = IslandStatusBar.run(command)
+            output = "$ $command\n$result"
+            busy = false
+            shizuku = IslandStatusBar.state()
+        }
+    }
+
+    Text("Status bar test (Shizuku)", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+    Text(
+        "Checks whether HyperOS 2 respects the status bar disable flags. Icons are restored " +
+                "automatically when the island service stops; a reboot also clears them.",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant
+    )
+    Text(
+        shizuku.label,
+        style = MaterialTheme.typography.bodyMedium,
+        color = if (shizuku == IslandStatusBar.ShizukuState.GRANTED) MaterialTheme.colorScheme.primary
+        else MaterialTheme.colorScheme.error
+    )
+    if (shizuku == IslandStatusBar.ShizukuState.PERMISSION_NEEDED) {
+        OutlinedButton(onClick = { IslandStatusBar.requestPermission() }, modifier = Modifier.fillMaxWidth()) {
+            Text("Grant Shizuku permission")
+        }
+    }
+    val enabled = shizuku == IslandStatusBar.ShizukuState.GRANTED && !busy
+    Button(
+        onClick = { runCommand(IslandStatusBar.CMD_HIDE_NOTIFICATION_ICONS) },
+        enabled = enabled,
+        modifier = Modifier.fillMaxWidth()
+    ) { Text("Hide notification icons") }
+    Button(
+        onClick = { runCommand(IslandStatusBar.CMD_HIDE_CLOCK_AND_ICONS) },
+        enabled = enabled,
+        modifier = Modifier.fillMaxWidth()
+    ) { Text("Hide clock + all icons") }
+    OutlinedButton(
+        onClick = { runCommand(IslandStatusBar.CMD_RESTORE) },
+        enabled = enabled,
+        modifier = Modifier.fillMaxWidth()
+    ) { Text("Restore") }
+    if (output.isNotEmpty()) {
+        Text(
+            output,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
     }
 }
 
