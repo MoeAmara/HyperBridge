@@ -55,6 +55,7 @@ class IslandTestActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         IslandController.setCalibration(IslandCalibrationStore.load(this))
         IslandController.setMotion(IslandCalibrationStore.loadMotion(this))
+        IslandController.setIconHide(IslandCalibrationStore.loadIconHide(this))
         enableEdgeToEdge()
         setContent {
             HyperBridgeTheme {
@@ -158,7 +159,7 @@ private fun IslandTestScreen(
         }
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             StateButton("Music pill", Modifier.weight(1f)) { IslandController.show(IslandMode.COMPACT_MUSIC) }
-            StateButton("Incoming", Modifier.weight(1f)) { IslandController.show(IslandMode.INCOMING) }
+            StateButton("Incoming", Modifier.weight(1f)) { IslandController.show(IslandMode.INCOMING_PILL) }
         }
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             StateButton("Timer", Modifier.weight(1f)) { IslandController.show(IslandMode.TIMER_PILL) }
@@ -181,6 +182,9 @@ private fun IslandTestScreen(
 
         Spacer(Modifier.height(12.dp))
         LockScreenSection()
+
+        Spacer(Modifier.height(12.dp))
+        IconHideSection()
 
         Spacer(Modifier.height(12.dp))
         MusicSection(onOpenNotificationAccess)
@@ -447,17 +451,67 @@ private fun MotionSection() {
     }
     Text("Animation tuning", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
     Text(
-        "Pill ↔ card morph. Lower bounce = more wobble. Saved and applied live; tap Replay to preview.",
+        "Pill ↔ card: one spring for the whole shape, content grows / melts with it. " +
+                "Lower bounce = more wobble, higher speed = faster. Saved and applied live; tap Replay to preview.",
         style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant
     )
     Button(onClick = { IslandController.replayMorph() }, modifier = Modifier.fillMaxWidth()) { Text("Replay (pill ↔ card)") }
     CalRow("Bounce (damping)", m.bounce, 0.40f, 1.00f, 0.01f, "") { set(m.copy(bounce = it)) }
-    CalRow("Speed (stiffness)", m.speed, 150f, 1200f, 10f, "") { set(m.copy(speed = it)) }
-    CalRow("Width leads height", m.widthLeadMs, 0f, 120f, 5f, "ms") { set(m.copy(widthLeadMs = it)) }
+    CalRow("Speed (stiffness)", m.speed, 120f, 1200f, 1f, "") { set(m.copy(speed = it)) }
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Text("Jelly squash", modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
+        Switch(checked = m.jelly, onCheckedChange = { set(m.copy(jelly = it)) })
+    }
+    if (m.jelly) {
+        CalRow("Jelly amount", m.jellyAmount, 0.00f, 0.12f, 0.01f, "") { set(m.copy(jellyAmount = it)) }
+    }
     CalRow("Content blur", m.blurDp, 0f, 24f, 1f, "dp") { set(m.copy(blurDp = it)) }
-    CalRow("Press squeeze", m.squeeze, 0.90f, 1.00f, 0.01f, "×") { set(m.copy(squeeze = it)) }
     OutlinedButton(onClick = { set(IslandMotion()) }, modifier = Modifier.fillMaxWidth()) { Text("Reset to defaults") }
+}
+
+@Composable
+private fun IconHideSection() {
+    val context = LocalContext.current
+    val prefs by IslandController.iconHide.collectAsState()
+    val status by IslandController.iconHideStatus.collectAsState()
+    var shizuku by remember { mutableStateOf(IslandStatusBar.ShizukuState.NOT_RUNNING) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            shizuku = IslandStatusBar.state()
+            delay(1500)
+        }
+    }
+    fun set(n: IconHidePrefs) {
+        IslandController.setIconHide(n)
+        IslandCalibrationStore.saveIconHide(context, n)
+    }
+    val granted = shizuku == IslandStatusBar.ShizukuState.GRANTED
+    Text("Hide status bar icons during", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+    Text(
+        "Optional, off by default. While the island shows a content whose switch is on, the notification icons " +
+                "next to the clock are hidden via Shizuku and come back when it ends. The notifications themselves stay. " +
+                "Shizuku: ${shizuku.label}. Last: $status",
+        style = MaterialTheme.typography.bodySmall,
+        color = if (granted) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.error
+    )
+    if (shizuku == IslandStatusBar.ShizukuState.PERMISSION_NEEDED) {
+        OutlinedButton(onClick = { IslandStatusBar.requestPermission() }, modifier = Modifier.fillMaxWidth()) {
+            Text("Grant Shizuku permission")
+        }
+    }
+    IconSwitchRow("Call", prefs.call, granted) { set(prefs.copy(call = it)) }
+    IconSwitchRow("Timer & Stopwatch", prefs.timer, granted) { set(prefs.copy(timer = it)) }
+    IconSwitchRow("Recorder", prefs.recorder, granted) { set(prefs.copy(recorder = it)) }
+}
+
+@Composable
+private fun IconSwitchRow(label: String, checked: Boolean, granted: Boolean, onChange: (Boolean) -> Unit) {
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Text(label, modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
+        // Can always be turned OFF; turning ON needs Shizuku.
+        Switch(checked = checked, enabled = granted || checked, onCheckedChange = onChange)
+    }
 }
 
 @Composable

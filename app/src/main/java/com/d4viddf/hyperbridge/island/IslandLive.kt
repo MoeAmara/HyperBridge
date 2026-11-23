@@ -50,7 +50,9 @@ data class IslandLive(
     val paused: Boolean,
     val actions: List<LiveAction>,
     val contentIntent: PendingIntent?,
-    val postTime: Long
+    val postTime: Long,
+    /** Timer: full length in ms (from the notification, else the largest remaining time seen). */
+    val totalMs: Long? = null
 ) {
     fun action(vararg roles: ActionRole): LiveAction? =
         roles.firstNotNullOfOrNull { r -> actions.firstOrNull { it.role == r } }
@@ -63,6 +65,38 @@ data class IslandLive(
             return formatDuration(((ms.coerceAtLeast(0L) + if (countDown) 999L else 0L) / 1000L))
         }
         return fixedTime
+    }
+
+    /** Timer: remaining fraction 0..1 for the progress ring (null if unknown). */
+    fun remainingFraction(nowMs: Long = System.currentTimeMillis()): Float? {
+        val total = totalMs ?: return null
+        if (total <= 0L) return null
+        val remaining = remainingMs(nowMs) ?: return null
+        return (remaining.toFloat() / total).coerceIn(0f, 1f)
+    }
+
+    /** Timer: remaining ms (running clock or parsed fixed time). */
+    fun remainingMs(nowMs: Long = System.currentTimeMillis()): Long? {
+        val base = chronoBaseMs
+        if (base != null && !paused && countDown) return (base - nowMs).coerceAtLeast(0L)
+        return fixedTime?.let { parseClockMs(it) }
+    }
+
+    /** Stopwatch / recorder: elapsed ms (running clock or parsed fixed time). */
+    fun elapsedMs(nowMs: Long = System.currentTimeMillis()): Long? {
+        val base = chronoBaseMs
+        if (base != null && !paused && !countDown) return (nowMs - base).coerceAtLeast(0L)
+        return fixedTime?.let { parseClockMs(it) }
+    }
+}
+
+/** "mm:ss" / "h:mm:ss" -> ms. */
+fun parseClockMs(t: String): Long? {
+    val parts = t.split(':').map { it.toLongOrNull() ?: return null }
+    return when (parts.size) {
+        2 -> (parts[0] * 60 + parts[1]) * 1000L
+        3 -> (parts[0] * 3600 + parts[1] * 60 + parts[2]) * 1000L
+        else -> null
     }
 }
 
@@ -107,6 +141,15 @@ object IslandNotifications {
     private val live = LinkedHashMap<String, IslandLive>() // by sbn key
     private val avatarCache = HashMap<String, ImageBitmap?>()
 
+    /** Local clock for recorders / stopwatches whose notification carries no usable time. */
+    private class LocalClock(var startMs: Long) {
+        var pausedAt: Long? = null
+    }
+    private val clocks = HashMap<String, LocalClock>()
+
+    /** Largest remaining time seen per timer (its total, when the notification doesn't say). */
+    private val timerTotals = HashMap<String, Long>()
+
     private val CALL_PACKAGES = setOf(
         "com.android.incallui", "com.google.android.dialer", "com.android.server.telecom",
         "com.android.phone", "com.android.dialer", "com.samsung.android.incallui"
@@ -147,6 +190,10 @@ object IslandNotifications {
     }
 
     fun onRemoved(sbn: StatusBarNotification) {
+        synchronized(clocks) {
+            clocks.remove(sbn.key)
+            timerTotals.remove(sbn.key)
+        }
         main.post {
             if (live.remove(sbn.key) != null) publish()
         }
@@ -240,7 +287,56 @@ object IslandNotifications {
 
         val running = showChrono || n.usesChronometerCompat()
         val paused = actions.any { it.role == ActionRole.RESUME } && actions.none { it.role == ActionRole.PAUSE }
-        val chronoBase = if (running && n.`when` > 0L && !paused) n.`when` else null
+        var chronoBase = if (running && n.`when` > 0L && !paused) n.`when` else null
+        val now = System.currentTimeMillis()
+        val textForTime = listOf(
+            title, text,
+            extras.getCharSequence(Notification.EXTRA_SUB_TEXT)?.toString() ?: "",
+            extras.getCharSequence(Notification.EXTRA_INFO_TEXT)?.toString() ?: "",
+            extras.getCharSequence(Notification.EXTRA_BIG_TEXT)?.toString() ?: "",
+            n.tickerText?.toString() ?: ""
+        )
+        var fixedTime: String? = textForTime.firstNotNullOfOrNull { timeIn(it) }
+        // Chronometer but counting the wrong way for its kind: trust the kind.
+        val effCountDown = if (kind == LiveKind.TIMER) true else if (kind == LiveKind.STOPWATCH || kind == LiveKind.RECORDER) false else countDown
+
+        if (chronoBase == null && !paused && fixedTime != null &&
+            (kind == LiveKind.RECORDER || kind == LiveKind.STOPWATCH || kind == LiveKind.TIMER)
+        ) {
+            // A time in the text ("00:25"): re-sync a local clock from it so it ticks between updates.
+            val ms = parseClockMs(fixedTime)
+            if (ms != null) {
+                chronoBase = if (effCountDown) now + ms else now - ms
+            }
+        }
+        if (chronoBase == null && fixedTime == null && (kind == LiveKind.RECORDER || kind == LiveKind.STOPWATCH)) {
+            // No usable time at all (e.g. Xiaomi Sound Recorder): count locally from when we first saw it.
+            synchronized(clocks) {
+                val plausibleWhen = n.`when`.takeIf { it in (now - 12 * 3600_000L)..now }
+                val c = clocks.getOrPut(sbn.key) { LocalClock(minOf(now, plausibleWhen ?: now)) }
+                if (paused) {
+                    if (c.pausedAt == null) c.pausedAt = now
+                    fixedTime = formatDuration(((c.pausedAt!! - c.startMs).coerceAtLeast(0L)) / 1000L)
+                } else {
+                    c.pausedAt?.let { c.startMs += now - it }
+                    c.pausedAt = null
+                    chronoBase = c.startMs
+                }
+            }
+        }
+        var totalMs: Long? = null
+        if (kind == LiveKind.TIMER) {
+            val remaining = if (chronoBase != null) chronoBase - now else fixedTime?.let { parseClockMs(it) }
+            val fromExtras = extras.getLong("android.progressMax", 0L).takeIf { it > 1000L }
+            synchronized(clocks) {
+                if (remaining != null && remaining > 0L) {
+                    val prev = timerTotals[sbn.key] ?: 0L
+                    if (remaining > prev + 1500L) timerTotals[sbn.key] = remaining // new / restarted timer
+                    else if (prev == 0L) timerTotals[sbn.key] = remaining
+                }
+                totalMs = fromExtras ?: timerTotals[sbn.key]
+            }
+        }
 
         var displayTitle = title
         if (kind == LiveKind.CALL || kind == LiveKind.INCOMING_CALL) {
@@ -264,12 +360,13 @@ object IslandNotifications {
             text = text,
             avatar = avatar,
             chronoBaseMs = chronoBase,
-            countDown = countDown,
-            fixedTime = timeIn("$title $text") ?: timeIn(extras.getCharSequence(Notification.EXTRA_SUB_TEXT)?.toString() ?: ""),
+            countDown = effCountDown,
+            fixedTime = fixedTime,
             paused = paused,
             actions = actions,
             contentIntent = n.contentIntent,
-            postTime = sbn.postTime
+            postTime = sbn.postTime,
+            totalMs = totalMs
         )
     }
 

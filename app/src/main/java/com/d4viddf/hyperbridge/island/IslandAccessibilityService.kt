@@ -38,6 +38,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -75,6 +77,14 @@ class IslandAccessibilityService : AccessibilityService(), LifecycleOwner, ViewM
     private var mediaJob: Job? = null
     private var mediaWatcher: IslandMediaWatcher? = null
     private var lockReceiver: BroadcastReceiver? = null
+    private var iconJob: Job? = null
+
+    /** Bumped on screen-on: re-check the status-bar flags (SystemUI may have reset them). */
+    private val iconRecheck = MutableStateFlow(0)
+
+    /** True while WE (the automatic hide) have the notification icons hidden. */
+    @Volatile
+    private var iconsHiddenByUs = false
 
     private fun refreshLocked() {
         val km = getSystemService(KeyguardManager::class.java)
@@ -88,6 +98,7 @@ class IslandAccessibilityService : AccessibilityService(), LifecycleOwner, ViewM
                 when (intent.action) {
                     Intent.ACTION_USER_PRESENT -> IslandController.setLocked(false)
                     else -> {
+                        if (intent.action == Intent.ACTION_SCREEN_ON) iconRecheck.value = iconRecheck.value + 1
                         refreshLocked()
                         // The keyguard may engage a moment after the screen turns off / on.
                         overlay?.postDelayed({ refreshLocked() }, 600L)
@@ -122,6 +133,7 @@ class IslandAccessibilityService : AccessibilityService(), LifecycleOwner, ViewM
         IslandController.setCalibration(IslandCalibrationStore.load(this))
         IslandController.setMotion(IslandCalibrationStore.loadMotion(this))
         IslandController.setShowOnLock(IslandCalibrationStore.loadShowOnLock(this))
+        IslandController.setIconHide(IslandCalibrationStore.loadIconHide(this))
         IslandMedia.appContext = applicationContext
         IslandController.setServiceRunning(true)
         addOverlay()
@@ -138,12 +150,50 @@ class IslandAccessibilityService : AccessibilityService(), LifecycleOwner, ViewM
             ) { m, g, c, r -> TouchState(m, g, c, r) }
                 .collect { updateTouchWindow(it) }
         }
+        startIconHide()
         // Real music: watch media sessions; retry until notification access is granted.
         val watcher = mediaWatcher ?: IslandMediaWatcher(this).also { mediaWatcher = it }
         mediaJob?.cancel()
         mediaJob = lifecycleScope.launch {
             while (isActive && !watcher.tryStart()) {
                 delay(3000)
+            }
+        }
+    }
+
+    /**
+     * Opt-in (Island Test switches, all OFF by default): while the island shows a call /
+     * timer / recorder whose switch is ON, hide the status-bar notification icons via Shizuku
+     * (`cmd statusbar send-disable-flag notification-icons`), and restore (`none`) as soon as
+     * that stops being true. Debounced so switching contents doesn't flicker. Never touches
+     * the notifications themselves.
+     */
+    private fun startIconHide() {
+        iconJob?.cancel()
+        iconJob = lifecycleScope.launch {
+            var lastTick = iconRecheck.value
+            combine(
+                IslandController.mode,
+                IslandController.shownLive,
+                IslandController.iconHide,
+                iconRecheck
+            ) { m, l, prefs, tick ->
+                Triple(m != IslandMode.HIDDEN && prefs.wants(l?.kind), tick, prefs)
+            }.collectLatest { (want, tick, prefs) ->
+                val recheck = tick != lastTick
+                lastTick = tick
+                if (!recheck && want == iconsHiddenByUs) return@collectLatest
+                if (!want && !iconsHiddenByUs) return@collectLatest
+                delay(if (want) 150L else 600L)
+                if (!prefs.call && !prefs.timer && !prefs.recorder && !iconsHiddenByUs) return@collectLatest
+                if (IslandStatusBar.state() != IslandStatusBar.ShizukuState.GRANTED) {
+                    IslandController.setIconHideStatus("skipped: " + IslandStatusBar.state().label)
+                    return@collectLatest
+                }
+                val cmd = if (want) IslandStatusBar.CMD_HIDE_NOTIFICATION_ICONS else IslandStatusBar.CMD_RESTORE
+                val out = IslandStatusBar.run(cmd)
+                if (out.startsWith("exit=0")) iconsHiddenByUs = want
+                IslandController.setIconHideStatus((if (want) "hidden" else "restored") + " → " + out.lineSequence().first())
             }
         }
     }
@@ -186,8 +236,11 @@ class IslandAccessibilityService : AccessibilityService(), LifecycleOwner, ViewM
     }
 
     override fun onDestroy() {
-        // Never leave status bar icons hidden by the Shizuku test.
-        if (IslandStatusBar.modified) {
+        iconJob?.cancel()
+        iconJob = null
+        // Never leave status bar icons hidden (automatic hide or the Shizuku test).
+        if (IslandStatusBar.modified || iconsHiddenByUs) {
+            iconsHiddenByUs = false
             CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
                 IslandStatusBar.run(IslandStatusBar.CMD_RESTORE)
             }

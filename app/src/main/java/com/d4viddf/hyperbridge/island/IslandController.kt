@@ -34,6 +34,9 @@ enum class IslandMode {
     /** Incoming call card: caller, green answer + red decline. */
     INCOMING,
 
+    /** Incoming call long pill (first stage): green phone with glow + "Incoming call". */
+    INCOMING_PILL,
+
     /** Compact timer / stopwatch pill: blue icon left, running time right. */
     TIMER_PILL,
 
@@ -56,7 +59,8 @@ fun IslandMode.isMusic(): Boolean = this == IslandMode.MUSIC || this == IslandMo
 
 /** Card -> its pill (pills map to themselves). */
 fun IslandMode.compact(): IslandMode = when (this) {
-    IslandMode.EXPANDED, IslandMode.INCOMING -> IslandMode.COMPACT
+    IslandMode.EXPANDED -> IslandMode.COMPACT
+    IslandMode.INCOMING -> IslandMode.INCOMING_PILL
     IslandMode.MUSIC -> IslandMode.COMPACT_MUSIC
     IslandMode.TIMER_CARD -> IslandMode.TIMER_PILL
     IslandMode.REC_CARD -> IslandMode.REC_PILL
@@ -66,6 +70,7 @@ fun IslandMode.compact(): IslandMode = when (this) {
 /** Pill -> its card (null when the pill has no card). */
 fun IslandMode.card(): IslandMode? = when (this) {
     IslandMode.COMPACT -> IslandMode.EXPANDED
+    IslandMode.INCOMING_PILL -> IslandMode.INCOMING
     IslandMode.COMPACT_MUSIC -> IslandMode.MUSIC
     IslandMode.TIMER_PILL -> IslandMode.TIMER_CARD
     IslandMode.REC_PILL -> IslandMode.REC_CARD
@@ -101,12 +106,27 @@ data class IslandCalibration(
  * bounce = spring dampingRatio (lower = bouncier), speed = spring stiffness.
  */
 data class IslandMotion(
-    val bounce: Float = 0.70f,
-    val speed: Float = 420f,
-    val widthLeadMs: Float = 40f,
-    val blurDp: Float = 12f,
-    val squeeze: Float = 0.97f
+    /** Spring dampingRatio for the whole shape (lower = bouncier). */
+    val bounce: Float = 0.62f,
+    /** Spring stiffness for the whole shape (higher = faster). */
+    val speed: Float = 223f,
+    /** Jelly squash on expand / collapse. */
+    val jelly: Boolean = true,
+    /** Jelly squash amount (fraction of size). */
+    val jellyAmount: Float = 0.05f,
+    /** Max blur of content that is appearing / melting away, in dp. */
+    val blurDp: Float = 14f
 )
+
+/** Which island contents hide the status-bar notification icons (all OFF by default). */
+data class IconHidePrefs(val call: Boolean = false, val timer: Boolean = false, val recorder: Boolean = false) {
+    fun wants(kind: LiveKind?): Boolean = when (kind) {
+        LiveKind.CALL, LiveKind.INCOMING_CALL -> call
+        LiveKind.TIMER, LiveKind.STOPWATCH -> timer
+        LiveKind.RECORDER -> recorder
+        null -> false
+    }
+}
 
 /** A rounded rect described by its horizontal centre, top edge, size and radius (all px). */
 data class IslandRectPx(val cx: Float, val top: Float, val w: Float, val h: Float, val r: Float) {
@@ -126,9 +146,9 @@ object IslandLayout {
     const val WIDE_WIDTH_RATIO = 0.53f        // wide (charging) pill width
     const val CARD_MARGIN_RATIO = 0.044f      // side margin of expanded cards
     const val CARD_RADIUS_RATIO = 0.055f      // corner radius of expanded cards
-    const val CALL_HEIGHT_RATIO = 0.22f       // expanded call card height
-    const val INCOMING_HEIGHT_RATIO = 0.22f   // incoming call card height
-    const val TIMER_HEIGHT_RATIO = 0.215f     // timer / stopwatch / recorder card height
+    const val CALL_HEIGHT_RATIO = 0.205f      // expanded call card height
+    const val INCOMING_HEIGHT_RATIO = 0.215f  // incoming call card height
+    const val TIMER_HEIGHT_RATIO = 0.195f     // timer / stopwatch / recorder card height
     const val MUSIC_HEIGHT_RATIO = 0.42f      // expanded music card height
 
     fun autoPillHeightPx(g: IslandGeometry, density: Float): Float =
@@ -198,6 +218,8 @@ object IslandLayout {
             IslandMode.COMPACT, IslandMode.COMPACT_MUSIC, IslandMode.TIMER_PILL, IslandMode.REC_PILL ->
                 pill(g, c, density, compactWidthPx(g, c, density))
             IslandMode.WIDE -> pill(g, c, density, wideWidthPx(g, c, density))
+            // a bit longer than the charging pill so "Incoming call" fits right of the camera
+            IslandMode.INCOMING_PILL -> pill(g, c, density, min(g.screenWidthPx * 0.66f, wideWidthPx(g, c, density) * 1.15f))
             IslandMode.EXPANDED -> card(g, c, density, CALL_HEIGHT_RATIO)
             IslandMode.INCOMING -> card(g, c, density, INCOMING_HEIGHT_RATIO)
             IslandMode.TIMER_CARD, IslandMode.REC_CARD -> card(g, c, density, TIMER_HEIGHT_RATIO)
@@ -232,7 +254,8 @@ object IslandCalibrationStore {
             .apply()
     }
 
-    private const val MOTION_PREFS = "island_motion"
+    // v2: one-spring liquid morph; the old Phase 3 keys (width lead, squeeze) are ignored.
+    private const val MOTION_PREFS = "island_motion_v2"
 
     fun loadMotion(context: Context): IslandMotion {
         val p = context.getSharedPreferences(MOTION_PREFS, Context.MODE_PRIVATE)
@@ -240,9 +263,9 @@ object IslandCalibrationStore {
         return IslandMotion(
             bounce = p.getFloat("bounce", d.bounce),
             speed = p.getFloat("speed", d.speed),
-            widthLeadMs = p.getFloat("widthLeadMs", d.widthLeadMs),
-            blurDp = p.getFloat("blurDp", d.blurDp),
-            squeeze = p.getFloat("squeeze", d.squeeze)
+            jelly = p.getBoolean("jelly", d.jelly),
+            jellyAmount = p.getFloat("jellyAmount", d.jellyAmount),
+            blurDp = p.getFloat("blurDp", d.blurDp)
         )
     }
 
@@ -250,9 +273,9 @@ object IslandCalibrationStore {
         context.getSharedPreferences(MOTION_PREFS, Context.MODE_PRIVATE).edit()
             .putFloat("bounce", m.bounce)
             .putFloat("speed", m.speed)
-            .putFloat("widthLeadMs", m.widthLeadMs)
+            .putBoolean("jelly", m.jelly)
+            .putFloat("jellyAmount", m.jellyAmount)
             .putFloat("blurDp", m.blurDp)
-            .putFloat("squeeze", m.squeeze)
             .apply()
     }
 
@@ -264,6 +287,24 @@ object IslandCalibrationStore {
     fun saveShowOnLock(context: Context, value: Boolean) {
         context.getSharedPreferences(OPTIONS_PREFS, Context.MODE_PRIVATE).edit()
             .putBoolean("showOnLock", value).apply()
+    }
+
+    /** Opt-in (default OFF): hide status-bar notification icons via Shizuku during these contents. */
+    fun loadIconHide(context: Context): IconHidePrefs {
+        val p = context.getSharedPreferences(OPTIONS_PREFS, Context.MODE_PRIVATE)
+        return IconHidePrefs(
+            call = p.getBoolean("hideIconsCall", false),
+            timer = p.getBoolean("hideIconsTimer", false),
+            recorder = p.getBoolean("hideIconsRecorder", false)
+        )
+    }
+
+    fun saveIconHide(context: Context, v: IconHidePrefs) {
+        context.getSharedPreferences(OPTIONS_PREFS, Context.MODE_PRIVATE).edit()
+            .putBoolean("hideIconsCall", v.call)
+            .putBoolean("hideIconsTimer", v.timer)
+            .putBoolean("hideIconsRecorder", v.recorder)
+            .apply()
     }
 }
 
@@ -326,6 +367,22 @@ object IslandController {
     private val _showOnLock = MutableStateFlow(false)
     val showOnLock: StateFlow<Boolean> = _showOnLock.asStateFlow()
 
+    /** Per-content opt-in switches: hide status-bar notification icons via Shizuku. */
+    private val _iconHide = MutableStateFlow(IconHidePrefs())
+    val iconHide: StateFlow<IconHidePrefs> = _iconHide.asStateFlow()
+
+    /** Result of the last automatic status-bar command (for Island Test). */
+    private val _iconHideStatus = MutableStateFlow("idle")
+    val iconHideStatus: StateFlow<String> = _iconHideStatus.asStateFlow()
+
+    fun setIconHide(value: IconHidePrefs) {
+        _iconHide.value = value
+    }
+
+    internal fun setIconHideStatus(text: String) {
+        _iconHideStatus.value = text
+    }
+
     /** Activity id currently on screen (null = hidden or a mock test state). */
     private var shownId: String? = null
 
@@ -383,7 +440,7 @@ object IslandController {
     private fun compactModeOf(a: Act): IslandMode = when (a.kind) {
         null -> IslandMode.COMPACT_MUSIC
         LiveKind.CALL -> IslandMode.COMPACT
-        LiveKind.INCOMING_CALL -> IslandMode.INCOMING
+        LiveKind.INCOMING_CALL -> IslandMode.INCOMING_PILL
         LiveKind.RECORDER -> IslandMode.REC_PILL
         LiveKind.TIMER, LiveKind.STOPWATCH -> IslandMode.TIMER_PILL
     }
@@ -391,7 +448,7 @@ object IslandController {
     private fun modeBelongsTo(m: IslandMode, a: Act): Boolean = when (a.kind) {
         null -> m.isMusic()
         LiveKind.CALL -> m == IslandMode.COMPACT || m == IslandMode.EXPANDED
-        LiveKind.INCOMING_CALL -> m == IslandMode.INCOMING || m == IslandMode.COMPACT
+        LiveKind.INCOMING_CALL -> m == IslandMode.INCOMING || m == IslandMode.INCOMING_PILL
         LiveKind.RECORDER -> m == IslandMode.REC_PILL || m == IslandMode.REC_CARD
         LiveKind.TIMER, LiveKind.STOPWATCH -> m == IslandMode.TIMER_PILL || m == IslandMode.TIMER_CARD
     }
@@ -573,7 +630,7 @@ object IslandController {
                 if (id != null) {
                     dismissed -= id
                     val a = acts.firstOrNull { it.id == id }
-                    if (a != null) setMode(compactModeOf(a).let { if (it == IslandMode.INCOMING) IslandMode.COMPACT else it }, id, acts)
+                    if (a != null) setMode(compactModeOf(a), id, acts)
                 } else {
                     setMode(back, null, acts)
                 }
@@ -586,8 +643,7 @@ object IslandController {
         _pressed.value = false
         val m = _mode.value
         if (!m.isCard()) {
-            if (m == IslandMode.COMPACT && _shownLive.value?.kind == LiveKind.INCOMING_CALL) go(IslandMode.INCOMING)
-            else m.card()?.let { go(it) }
+            m.card()?.let { go(it) }
             return
         }
         val hit = buttonRects.entries.firstOrNull { (_, r) -> r.contains(Offset(x, y)) }?.key
@@ -608,7 +664,9 @@ object IslandController {
                 IslandButton.HANG_UP -> live.action(ActionRole.HANG_UP, ActionRole.DECLINE)
                 IslandButton.SPEAKER -> live.action(ActionRole.SPEAKER)
                 IslandButton.PRIMARY -> live.action(ActionRole.PAUSE, ActionRole.RESUME)
-                IslandButton.SECONDARY -> live.action(ActionRole.STOP, ActionRole.LAP)
+                IslandButton.SECONDARY ->
+                    if (live.kind == LiveKind.STOPWATCH && !live.paused) live.action(ActionRole.LAP, ActionRole.STOP)
+                    else live.action(ActionRole.STOP, ActionRole.LAP, ActionRole.HANG_UP)
                 else -> null
             }
             if (action?.intent != null) sendPendingIntent(action.intent)
@@ -659,14 +717,13 @@ object IslandController {
     fun onPullDown() {
         _pressed.value = false
         val m = _mode.value
-        if (m == IslandMode.COMPACT && _shownLive.value?.kind == LiveKind.INCOMING_CALL) go(IslandMode.INCOMING)
-        else m.card()?.let { go(it) }
+        m.card()?.let { go(it) }
     }
 
     /** A touch anywhere outside the island: an expanded card collapses back to its pill. */
     fun onOutsideTouch() {
         val m = _mode.value
-        if (m.isCard() && m != IslandMode.INCOMING) go(m.compact())
+        if (m.isCard()) go(m.compact())
     }
 
     internal fun setButtonRect(button: IslandButton, rect: Rect, touchPaddingPx: Float) {
