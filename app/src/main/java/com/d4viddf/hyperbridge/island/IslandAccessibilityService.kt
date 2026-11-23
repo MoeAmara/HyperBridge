@@ -41,6 +41,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlin.math.abs
@@ -78,6 +79,10 @@ class IslandAccessibilityService : AccessibilityService(), LifecycleOwner, ViewM
     private var mediaWatcher: IslandMediaWatcher? = null
     private var lockReceiver: BroadcastReceiver? = null
     private var iconJob: Job? = null
+    private var headsUpJob: Job? = null
+    private var minimalJob: Job? = null
+    private val wifiConnected = MutableStateFlow(false)
+    private var netCallback: android.net.ConnectivityManager.NetworkCallback? = null
 
     /** Bumped on screen-on: re-check the status-bar flags (SystemUI may have reset them). */
     private val iconRecheck = MutableStateFlow(0)
@@ -146,11 +151,14 @@ class IslandAccessibilityService : AccessibilityService(), LifecycleOwner, ViewM
                 IslandController.mode,
                 IslandController.geometry,
                 IslandController.calibration,
-                IslandController.restorable
-            ) { m, g, c, r -> TouchState(m, g, c, r) }
+                IslandController.restorable,
+                IslandController.compactNeedPx
+            ) { m, g, c, r, need -> TouchState(m, g, c, r, need) }
                 .collect { updateTouchWindow(it) }
         }
         startIconHide()
+        startHeadsUpGuard()
+        startMinimalStatus()
         // Real music: watch media sessions; retry until notification access is granted.
         val watcher = mediaWatcher ?: IslandMediaWatcher(this).also { mediaWatcher = it }
         mediaJob?.cancel()
@@ -176,25 +184,117 @@ class IslandAccessibilityService : AccessibilityService(), LifecycleOwner, ViewM
                 IslandController.mode,
                 IslandController.shownLive,
                 IslandController.iconHide,
-                iconRecheck
-            ) { m, l, prefs, tick ->
-                Triple(m != IslandMode.HIDDEN && prefs.wants(l?.kind), tick, prefs)
-            }.collectLatest { (want, tick, prefs) ->
-                val recheck = tick != lastTick
-                lastTick = tick
-                if (!recheck && want == iconsHiddenByUs) return@collectLatest
-                if (!want && !iconsHiddenByUs) return@collectLatest
-                delay(if (want) 150L else 600L)
-                if (!prefs.call && !prefs.timer && !prefs.recorder && !iconsHiddenByUs) return@collectLatest
-                if (IslandStatusBar.state() != IslandStatusBar.ShizukuState.GRANTED) {
-                    IslandController.setIconHideStatus("skipped: " + IslandStatusBar.state().label)
-                    return@collectLatest
-                }
-                val cmd = if (want) IslandStatusBar.CMD_HIDE_NOTIFICATION_ICONS else IslandStatusBar.CMD_RESTORE
-                val out = IslandStatusBar.run(cmd)
-                if (out.startsWith("exit=0")) iconsHiddenByUs = want
-                IslandController.setIconHideStatus((if (want) "hidden" else "restored") + " → " + out.lineSequence().first())
+                iconRecheck,
+                IslandStatusMinimal.enabled
+            ) { m, l, prefs, tick, minimal ->
+                // Only the KIND matters: the live object changes every second (timer / recorder
+                // ticks), which used to cancel the debounce below before the command could run.
+                Pair(m != IslandMode.HIDDEN && (minimal || prefs.wants(l?.kind ?: m.mockLiveKind())), tick)
             }
+                .distinctUntilChanged()
+                .collectLatest { (want, tick) ->
+                    val recheck = tick != lastTick
+                    lastTick = tick
+                    if (!recheck && want == iconsHiddenByUs) return@collectLatest
+                    if (!want && !iconsHiddenByUs) return@collectLatest
+                    delay(if (want) 150L else 600L)
+                    val state = IslandStatusBar.state()
+                    if (state != IslandStatusBar.ShizukuState.GRANTED) {
+                        IslandController.setIconHideStatus("error: skipped (" + state.label + ")")
+                        return@collectLatest
+                    }
+                    val cmd = if (want) IslandStatusBar.CMD_HIDE_NOTIFICATION_ICONS else IslandStatusBar.CMD_RESTORE
+                    val out = try {
+                        IslandStatusBar.run(cmd)
+                    } catch (e: Throwable) {
+                        "error: ${e.javaClass.simpleName}: ${e.message}"
+                    }
+                    if (out.startsWith("exit=0")) iconsHiddenByUs = want
+                    IslandController.setIconHideStatus(
+                        (if (want) "auto hide" else "auto restore") + " → " + out.trim().ifEmpty { "(no output)" }
+                    )
+                }
+        }
+    }
+
+    /**
+     * Opt-in: while an incoming call rings, turn heads-up off via Shizuku so the system call popup
+     * doesn't sit on top of the island; restore the exact previous value as soon as ringing ends.
+     * Also restores a leftover change on start (e.g. after a crash) so it can never stay off.
+     */
+    private fun startHeadsUpGuard() {
+        IslandCallControl.loadHidePopup(this)
+        headsUpJob?.cancel()
+        headsUpJob = lifecycleScope.launch {
+            IslandCallControl.restoreHeadsUp(this@IslandAccessibilityService, "service start")
+            // Safety net: if a restore couldn't run (Shizuku was down), retry until it does.
+            launch {
+                while (isActive) {
+                    delay(20_000L)
+                    if (!IslandNotifications.ringing.value &&
+                        IslandCallControl.headsUpChangedByUs(this@IslandAccessibilityService)
+                    ) IslandCallControl.restoreHeadsUp(this@IslandAccessibilityService, "retry")
+                }
+            }
+            combine(IslandNotifications.ringing, IslandCallControl.hidePopup) { ringing, on -> ringing && on }
+                .distinctUntilChanged()
+                .collectLatest { want ->
+                    if (want) IslandCallControl.suppressHeadsUp(this@IslandAccessibilityService)
+                    else IslandCallControl.restoreHeadsUp(this@IslandAccessibilityService, "ringing ended / switch off")
+                }
+        }
+    }
+
+    /**
+     * Opt-in: while the island is visible, keep only clock, battery and one connectivity icon
+     * (Wi-Fi if connected, else mobile) via `settings secure icon_blacklist`; restore exactly when hidden.
+     */
+    private fun startMinimalStatus() {
+        IslandStatusMinimal.load(this)
+        registerWifiWatch()
+        minimalJob?.cancel()
+        minimalJob = lifecycleScope.launch {
+            IslandStatusMinimal.restore(this@IslandAccessibilityService, "service start")
+            launch {
+                while (isActive) {
+                    delay(20_000L)
+                    if (IslandController.mode.value == IslandMode.HIDDEN &&
+                        IslandStatusMinimal.changedByUs(this@IslandAccessibilityService)
+                    ) IslandStatusMinimal.restore(this@IslandAccessibilityService, "retry")
+                }
+            }
+            combine(IslandController.mode, IslandStatusMinimal.enabled, wifiConnected) { m, on, wifi ->
+                if (on && m != IslandMode.HIDDEN) wifi else null // null = restore
+            }
+                .distinctUntilChanged()
+                .collectLatest { wifi ->
+                    if (wifi != null) {
+                        delay(150L)
+                        IslandStatusMinimal.apply(this@IslandAccessibilityService, wifi)
+                    } else {
+                        delay(600L)
+                        IslandStatusMinimal.restore(this@IslandAccessibilityService, "island hidden / switch off")
+                    }
+                }
+        }
+    }
+
+    private fun registerWifiWatch() {
+        if (netCallback != null) return
+        val cm = getSystemService(android.net.ConnectivityManager::class.java) ?: return
+        val cb = object : android.net.ConnectivityManager.NetworkCallback() {
+            override fun onCapabilitiesChanged(network: android.net.Network, caps: android.net.NetworkCapabilities) {
+                wifiConnected.value = caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI)
+            }
+            override fun onLost(network: android.net.Network) {
+                wifiConnected.value = false
+            }
+        }
+        try {
+            cm.registerDefaultNetworkCallback(cb)
+            netCallback = cb
+        } catch (e: Exception) {
+            Log.e(TAG, "network callback failed", e)
         }
     }
 
@@ -202,7 +302,9 @@ class IslandAccessibilityService : AccessibilityService(), LifecycleOwner, ViewM
         val mode: IslandMode,
         val geometry: IslandGeometry?,
         val calibration: IslandCalibration,
-        val restorable: IslandMode?
+        val restorable: IslandMode?,
+        /** Counter pill width need; only here so the touch window follows a widening pill. */
+        val compactNeedPx: Float = 0f
     )
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -238,6 +340,24 @@ class IslandAccessibilityService : AccessibilityService(), LifecycleOwner, ViewM
     override fun onDestroy() {
         iconJob?.cancel()
         iconJob = null
+        headsUpJob?.cancel()
+        headsUpJob = null
+        minimalJob?.cancel()
+        minimalJob = null
+        netCallback?.let { cb ->
+            try { getSystemService(android.net.ConnectivityManager::class.java)?.unregisterNetworkCallback(cb) } catch (_: Exception) {}
+        }
+        netCallback = null
+        if (IslandStatusMinimal.changedByUs(this)) {
+            val c = applicationContext
+            CoroutineScope(SupervisorJob() + Dispatchers.IO).launch { IslandStatusMinimal.restore(c, "service stopped") }
+        }
+        if (IslandCallControl.headsUpChangedByUs(this)) {
+            val ctx = applicationContext
+            CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+                IslandCallControl.restoreHeadsUp(ctx, "service stopped")
+            }
+        }
         // Never leave status bar icons hidden (automatic hide or the Shizuku test).
         if (IslandStatusBar.modified || iconsHiddenByUs) {
             iconsHiddenByUs = false

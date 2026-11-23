@@ -85,6 +85,7 @@ import androidx.compose.ui.layout.layout
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Constraints
@@ -97,6 +98,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.math.abs
+import kotlin.math.max
 import kotlin.math.floor
 import kotlin.math.roundToInt
 import kotlin.math.sin
@@ -361,15 +363,15 @@ fun IslandOverlay(
     }
 
     // Live calibration: when sizes/offsets change while the island is settled, follow immediately.
-    val liveTarget = IslandLayout.target(mode, geometry, calibration, d)
+    val compactNeed by IslandController.compactNeedPx.collectAsState()
+    val liveTarget = remember(mode, geometry, calibration, d, compactNeed) { IslandLayout.target(mode, geometry, calibration, d) }
     LaunchedEffect(liveTarget) {
         if (!transitioning && displayedMode == mode && mode != IslandMode.HIDDEN) {
-            anim.snapShape(liveTarget)
+            // Calibration or a counter growing (59:59 -> 1:00:00): follow with a quick spring.
+            val follow = spring<Float>(dampingRatio = 0.85f, stiffness = 700f)
+            anim.animateShape(liveTarget, follow, follow, follow)
         }
     }
-
-    val blurMax = with(density) { motion.blurDp.coerceIn(0f, 40f).dp.toPx() }
-    val cameraGap = with(density) { (geometry.cameraDiameterPx + 10f * d).toDp() }
 
     // Shared mock clock so mock timers keep running across compact <-> expanded.
     val mockSeconds by produceState(initialValue = 5) {
@@ -378,6 +380,29 @@ fun IslandOverlay(
             value += 1
         }
     }
+
+    // Counter pills size themselves to their content: icon | camera | time, never clipped.
+    val textMeasurer = rememberTextMeasurer()
+    val pillTemplate = pillTimeText(mode, live, mockSeconds)?.map { if (it.isDigit()) '0' else it }?.joinToString("")
+    LaunchedEffect(pillTemplate, mode, geometry.cameraDiameterPx, density.fontScale) {
+        if (pillTemplate == null) {
+            IslandController.setCompactNeedPx(0f)
+        } else {
+            val textW = textMeasurer.measure(
+                pillTemplate,
+                TextStyle(fontSize = PillTimeSize, fontWeight = FontWeight.SemiBold, fontFeatureSettings = "tnum"),
+                softWrap = false,
+                maxLines = 1
+            ).size.width.toFloat()
+            val side = max(pillLeftDp(mode) * d, textW) + 3f * d
+            val gap = geometry.cameraDiameterPx + 10f * d
+            IslandController.setCompactNeedPx(2f * PillPad.value * d + gap + 2f * side)
+        }
+    }
+
+    val blurMax = with(density) { motion.blurDp.coerceIn(0f, 40f).dp.toPx() }
+    val cameraGap = with(density) { (geometry.cameraDiameterPx + 10f * d).toDp() }
+
 
     CompositionLocalProvider(LocalCameraGap provides cameraGap) {
         Box(Modifier.fillMaxSize()) {
@@ -510,6 +535,26 @@ private fun formatClock(totalSeconds: Int): String {
 
 private val DigitsStyle = TextStyle(fontFeatureSettings = "tnum")
 
+/** Time in the small pills: white, semibold, about the status-bar clock size (Xiaomi refs). */
+private val PillTimeSize = 15.sp
+
+/** Pill side paddings (must match [PillSides]). */
+private val PillPad = 11.dp
+
+/** The live time a counter pill shows on the right of the camera (null for non-counter modes). */
+private fun pillTimeText(mode: IslandMode, live: IslandLive?, mockSeconds: Int): String? {
+    val now = System.currentTimeMillis()
+    return when (mode) {
+        IslandMode.COMPACT -> if (live == null) formatClock(mockSeconds) else live.timeText(now) ?: live.text.ifBlank { "Call" }
+        IslandMode.TIMER_PILL -> timerText(live, now, mockSeconds, live?.kind == LiveKind.STOPWATCH)
+        IslandMode.REC_PILL -> recText(live, now, formatClock(mockSeconds))
+        else -> null
+    }
+}
+
+/** Width of the left-hand icon / waveform of a counter pill. */
+private fun pillLeftDp(mode: IslandMode): Float = if (mode == IslandMode.REC_PILL) 34f else 18f
+
 /** Wall clock that ticks while the composable is visible (for live timers). */
 @Composable
 private fun rememberNow(periodMs: Long = 250L): Long {
@@ -552,7 +597,7 @@ private fun rememberPulse(periodMs: Int = 700): Float {
 /** Compact pill layout: content left and right of the camera hole, never over it. */
 @Composable
 private fun PillSides(
-    horizontalPadding: Dp = 11.dp,
+    horizontalPadding: Dp = PillPad,
     left: @Composable BoxScope.() -> Unit,
     right: @Composable BoxScope.() -> Unit
 ) {
@@ -600,11 +645,12 @@ private fun CompactCallContent(live: IslandLive?, mockTime: String) {
             Text(
                 text = right,
                 color = IslandSpec.TextPrimary,
-                fontSize = 14.sp,
+                fontSize = PillTimeSize,
                 fontWeight = FontWeight.SemiBold,
                 style = DigitsStyle,
                 maxLines = 1,
-                overflow = TextOverflow.Ellipsis
+                softWrap = false,
+                overflow = if (right.any { it.isDigit() }) TextOverflow.Clip else TextOverflow.Ellipsis
             )
         }
     )
@@ -717,7 +763,9 @@ private fun ExpandedCallContent(live: IslandLive?, mockTime: String) {
     val now = rememberNow()
     val name = live?.title?.ifBlank { null } ?: if (live == null) "Xiaomi" else "Call"
     val time = if (live == null) mockTime else live.timeText(now) ?: live.text
-    val showSpeaker = live == null || live.action(ActionRole.SPEAKER) != null
+    val speakerUnsupported by IslandCallControl.speakerUnsupported.collectAsState()
+    val showSpeaker = live == null || live.action(ActionRole.SPEAKER) != null ||
+            (live.kind == LiveKind.CALL && live.sbnKey !in speakerUnsupported)
     Row(
         modifier = Modifier.fillMaxSize().padding(start = 22.dp, end = 14.dp),
         verticalAlignment = Alignment.CenterVertically
@@ -927,7 +975,7 @@ private fun TimerPillContent(live: IslandLive?, mockSeconds: Int) {
             Text(
                 text = timerText(live, now, mockSeconds, stopwatch),
                 color = if (paused) IslandSpec.TextSecondary else IslandSpec.TextPrimary,
-                fontSize = 14.sp,
+                fontSize = PillTimeSize,
                 fontWeight = FontWeight.SemiBold,
                 style = DigitsStyle,
                 maxLines = 1
@@ -1042,7 +1090,7 @@ private fun RecPillContent(live: IslandLive?, mockTime: String) {
             Text(
                 text = recText(live, now, mockTime),
                 color = if (paused) IslandSpec.TextSecondary else IslandSpec.TextPrimary,
-                fontSize = 14.sp,
+                fontSize = PillTimeSize,
                 fontWeight = FontWeight.SemiBold,
                 style = DigitsStyle,
                 maxLines = 1

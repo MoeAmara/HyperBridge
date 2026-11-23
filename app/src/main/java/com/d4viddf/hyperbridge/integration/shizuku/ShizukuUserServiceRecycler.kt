@@ -138,7 +138,7 @@ object ShizukuUserServiceRecycler {
                     .daemon(true)  // Keep as daemon to avoid repeated reconnections
                     .processNameSuffix("privileged")
                     .debuggable(BuildConfig.DEBUG)
-                    .version(3)  // 3: added runShellCommand
+                    .version(4)  // 3: added runShellCommand; 4: force a fresh daemon after island updates
 
                 serviceArgs = args
 

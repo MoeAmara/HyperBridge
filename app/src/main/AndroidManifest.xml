@@ -10,6 +10,10 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <!-- Island: answer / end calls from the island when the call notification has no action. -->
+    <uses-permission android:name="android.permission.ANSWER_PHONE_CALLS" />
+    <!-- Island: minimal status bar keeps Wi-Fi or mobile depending on the active network. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="moe.shizuku.manager.permission.API_V23" />
 
     <queries>

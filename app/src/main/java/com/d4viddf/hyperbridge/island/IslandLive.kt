@@ -28,9 +28,20 @@ enum class LiveKind(val priority: Int) {
 }
 
 /** What a notification action does, guessed from CallStyle extras or the action title. */
-enum class ActionRole { ANSWER, DECLINE, HANG_UP, SPEAKER, MUTE, PAUSE, RESUME, STOP, LAP, OTHER }
+enum class ActionRole { ANSWER, DECLINE, HANG_UP, SPEAKER, MUTE, PAUSE, RESUME, STOP, LAP, RESET, CANCEL, ADD_TIME, OTHER }
 
-data class LiveAction(val title: String, val role: ActionRole, val intent: PendingIntent?)
+data class LiveAction(
+    val title: String,
+    val role: ActionRole,
+    val intent: PendingIntent?,
+    /** Notification.Action.getSemanticAction() (0 = none). */
+    val semantic: Int = 0,
+    val hasRemoteInput: Boolean = false,
+    /** Resource entry name of the action icon when resolvable (e.g. "ic_pause"). */
+    val iconName: String? = null,
+    /** How the role was decided: title / semantic / icon / callstyle / none. */
+    val matchedBy: String = "title"
+)
 
 /** One live activity (call / timer / stopwatch / recorder) the island can show. */
 data class IslandLive(
@@ -199,9 +210,18 @@ object IslandNotifications {
         }
     }
 
+    private val _ringing = kotlinx.coroutines.flow.MutableStateFlow(false)
+    /** True while any incoming (ringing) call notification is live. */
+    val ringing: kotlinx.coroutines.flow.StateFlow<Boolean> = _ringing
+
     private fun publish() {
+        _ringing.value = live.values.any { it.kind == LiveKind.INCOMING_CALL }
         IslandController.setLive(live.values.toList())
     }
+
+    /** Main thread only: is a live activity with this notification key still of one of [kinds]? */
+    fun isLive(sbnKey: String, vararg kinds: LiveKind): Boolean =
+        live[sbnKey]?.let { it.kind in kinds } ?: false
 
     // ---------------------------------------------------------------------------------------
 
@@ -270,15 +290,30 @@ object IslandNotifications {
             val answer = extraIntent("android.answerIntent")
             val decline = extraIntent("android.declineIntent")
             val hangUp = extraIntent("android.hangUpIntent")
+            val isCall = kind == LiveKind.CALL || kind == LiveKind.INCOMING_CALL
             for (a in rawActions) {
                 val t = a.title?.toString() ?: ""
+                val semantic = if (Build.VERSION.SDK_INT >= 28) a.semanticAction else 0
+                val hasRemote = !a.remoteInputs.isNullOrEmpty()
+                val iconName = actionIconName(context, pkg, a)
+                var by = "title"
                 var role = roleOf(t)
-                if (a.actionIntent != null) {
-                    if (a.actionIntent == answer) role = ActionRole.ANSWER
-                    if (a.actionIntent == decline) role = ActionRole.DECLINE
-                    if (a.actionIntent == hangUp) role = ActionRole.HANG_UP
+                if (role == ActionRole.OTHER) {
+                    role = roleOfSemantic(semantic, isCall); by = "semantic"
                 }
-                add(LiveAction(t, role, a.actionIntent))
+                if (role == ActionRole.OTHER) {
+                    role = roleOfIcon(iconName); by = "icon"
+                }
+                if (hasRemote) role = ActionRole.OTHER // a reply box, never a control
+                if (a.actionIntent != null) {
+                    if (a.actionIntent == answer) { role = ActionRole.ANSWER; by = "callstyle" }
+                    if (a.actionIntent == decline) { role = ActionRole.DECLINE; by = "callstyle" }
+                    if (a.actionIntent == hangUp) { role = ActionRole.HANG_UP; by = "callstyle" }
+                }
+                // A call-ending word on a non-call content means "stop".
+                if (!isCall && role == ActionRole.HANG_UP) role = ActionRole.STOP
+                if (role == ActionRole.OTHER) by = "none"
+                add(LiveAction(t, role, a.actionIntent, semantic, hasRemote, iconName, by))
             }
             if (answer != null && none { it.role == ActionRole.ANSWER }) add(LiveAction("Answer", ActionRole.ANSWER, answer))
             if (decline != null && none { it.role == ActionRole.DECLINE }) add(LiveAction("Decline", ActionRole.DECLINE, decline))
@@ -383,22 +418,98 @@ object IslandNotifications {
         return TIME_RE.find(latin)?.groupValues?.get(1)
     }
 
-    private fun roleOf(title: String?): ActionRole {
-        val t = (title ?: "").trim().lowercase()
+    /** Folds Arabic letter variants and diacritics so keyword matching is forgiving. */
+    private fun norm(x: String): String {
+        val sb = StringBuilder()
+        for (ch in x.trim().lowercase()) {
+            when (ch) {
+                'أ', 'إ', 'آ', 'ٱ' -> sb.append('ا')
+                'ة' -> sb.append('ه')
+                'ى' -> sb.append('ي')
+                'ؤ' -> sb.append('و')
+                'ئ' -> sb.append('ي')
+                in '\u064B'..'\u0652', 'ـ' -> {} // tashkeel, tatweel
+                else -> sb.append(ch)
+            }
+        }
+        return sb.toString()
+    }
+
+    internal fun roleOf(title: String?): ActionRole {
+        val t = norm(title ?: "")
         if (t.isEmpty()) return ActionRole.OTHER
-        fun has(vararg w: String) = w.any { t.contains(it) }
+        val words = t.split(Regex("[^\\p{L}\\p{N}+]+")).filter { it.isNotEmpty() }.toSet()
+        fun phrase(vararg p: String) = p.any { t.contains(norm(it)) }
+        fun word(vararg w: String) = w.any { norm(it) in words }
         return when {
-            has("answer", "accept", "إجابة", "اجابة", "رد", "قبول") && !has("reply", "message", "رسالة") -> ActionRole.ANSWER
-            has("decline", "reject", "dismiss call", "رفض") -> ActionRole.DECLINE
-            has("hang up", "hang-up", "end call", "إنهاء", "انهاء", "إغلاق الخط") -> ActionRole.HANG_UP
-            has("speaker", "مكبر") -> ActionRole.SPEAKER
-            has("mute", "كتم") -> ActionRole.MUTE
-            has("pause", "إيقاف مؤقت", "ايقاف مؤقت") -> ActionRole.PAUSE
-            has("resume", "continue", "start", "play", "استئناف", "متابعة", "تشغيل", "بدء") -> ActionRole.RESUME
-            has("lap", "لفة", "دورة") -> ActionRole.LAP
-            has("stop", "cancel", "reset", "delete", "finish", "done", "save", "إيقاف", "ايقاف", "إلغاء", "الغاء", "حفظ", "إعادة") -> ActionRole.STOP
+            phrase("reply", "message", "رساله", "sms") -> ActionRole.OTHER
+            phrase("answer", "accept", "pick up", "اجابه", "قبول", "الرد") || word("رد") -> ActionRole.ANSWER
+            phrase("decline", "reject", "ignore call", "رفض") -> ActionRole.DECLINE
+            phrase("hang up", "hang-up", "hangup", "end call", "انهاء المكالمه", "اغلاق الخط", "قطع المكالمه") -> ActionRole.HANG_UP
+            phrase("speaker", "مكبر", "سماعه خارجيه", "السماعه الخارجيه") -> ActionRole.SPEAKER
+            phrase("unmute", "mute", "كتم") -> ActionRole.MUTE
+            phrase("pause", "ايقاف مؤقت", "ايقاف موقت", "توقف مؤقت", "توقف موقت", "ايقاف مؤقتا", "ايقاف مؤقتً") -> ActionRole.PAUSE
+            phrase("resume", "continue", "استئناف", "استيناف", "استءناف", "متابعه", "استمرار", "استكمال") ||
+                    word("start", "play", "تشغيل", "بدء", "ابدا") -> ActionRole.RESUME
+            word("lap", "laps", "لفه", "دوره", "جوله") -> ActionRole.LAP
+            phrase("reset", "restart", "اعاده تعيين", "اعاده الضبط", "اعاده ضبط", "اعاده تشغيل", "اعاده") -> ActionRole.RESET
+            phrase("+1", "+ 1", "add 1", "1 min", "add time", "دقيقه", "اضافه") -> ActionRole.ADD_TIME
+            phrase("cancel", "dismiss", "delete", "discard", "الغاء", "حذف", "تجاهل", "اغلاق", "تخطي") ||
+                    word("close") -> ActionRole.CANCEL
+            phrase("stop", "finish", "save", "ايقاف", "توقف", "حفظ", "انهاء", "انتهاء") ||
+                    word("done", "end", "تم") -> ActionRole.STOP
             else -> ActionRole.OTHER
         }
+    }
+
+    private fun roleOfSemantic(semantic: Int, isCall: Boolean): ActionRole = when (semantic) {
+        Notification.Action.SEMANTIC_ACTION_DELETE -> ActionRole.CANCEL
+        Notification.Action.SEMANTIC_ACTION_MUTE, Notification.Action.SEMANTIC_ACTION_UNMUTE -> ActionRole.MUTE
+        Notification.Action.SEMANTIC_ACTION_CALL -> if (isCall) ActionRole.ANSWER else ActionRole.OTHER
+        else -> ActionRole.OTHER
+    }
+
+    internal fun roleOfIcon(name: String?): ActionRole {
+        val n = name?.lowercase() ?: return ActionRole.OTHER
+        fun has(vararg w: String) = w.any { n.contains(it) }
+        return when {
+            has("call_end", "callend", "hangup", "hang_up", "end_call", "endcall") -> ActionRole.HANG_UP
+            has("decline", "reject") -> ActionRole.DECLINE
+            has("answer", "accept") -> ActionRole.ANSWER
+            has("speaker", "volume") -> ActionRole.SPEAKER
+            has("mute", "mic_off") -> ActionRole.MUTE
+            has("pause") -> ActionRole.PAUSE
+            has("play", "resume", "start") -> ActionRole.RESUME
+            has("lap", "flag") -> ActionRole.LAP
+            has("reset", "refresh", "restart", "replay") -> ActionRole.RESET
+            has("stop", "done", "save", "check") -> ActionRole.STOP
+            has("close", "cancel", "clear", "delete", "dismiss") -> ActionRole.CANCEL
+            has("add", "plus") -> ActionRole.ADD_TIME
+            else -> ActionRole.OTHER
+        }
+    }
+
+    private val iconNameCache = HashMap<String, String?>()
+
+    /** Resource entry name of an action's icon (resource icons only), cached per package+id. */
+    private fun actionIconName(context: Context, pkg: String, a: Notification.Action): String? = try {
+        val icon: Icon? = a.getIcon()
+        if (icon == null || icon.type != Icon.TYPE_RESOURCE) null
+        else {
+            val resPkg = icon.resPackage?.takeIf { it.isNotEmpty() } ?: pkg
+            val key = resPkg + "/" + icon.resId
+            synchronized(iconNameCache) {
+                if (iconNameCache.containsKey(key)) iconNameCache[key]
+                else {
+                    val res = context.packageManager.getResourcesForApplication(resPkg)
+                    val name = try { res.getResourceEntryName(icon.resId) } catch (_: Exception) { null }
+                    iconNameCache[key] = name
+                    name
+                }
+            }
+        }
+    } catch (_: Exception) {
+        null
     }
 
     private fun loadAvatar(context: Context, n: Notification, extras: Bundle): ImageBitmap? = try {
@@ -439,7 +550,20 @@ object IslandNotifications {
             sb.append("  title=").append(e.getCharSequence(Notification.EXTRA_TITLE)).append('\n')
             sb.append("  text=").append(e.getCharSequence(Notification.EXTRA_TEXT)).append('\n')
             sb.append("  subText=").append(e.getCharSequence(Notification.EXTRA_SUB_TEXT)).append('\n')
-            sb.append("  actions=").append(n.actions?.joinToString { "\"" + it.title + "\"" } ?: "none").append('\n')
+            val parsedActions = live[sbn.key]?.actions
+            val acts = n.actions
+            if (acts.isNullOrEmpty()) sb.append("  actions=none\n")
+            else acts.forEachIndexed { i, a ->
+                val sem = if (Build.VERSION.SDK_INT >= 28) a.semanticAction else 0
+                val pa = parsedActions?.getOrNull(i)
+                sb.append("  action[").append(i).append("] \"").append(a.title).append("\"")
+                    .append(" semantic=").append(sem)
+                    .append(" remoteInput=").append(!a.remoteInputs.isNullOrEmpty())
+                    .append(" icon=").append(pa?.iconName ?: actionIconName(l, sbn.packageName, a))
+                    .append(" intent=").append(if (a.actionIntent == null) "none" else if (a.actionIntent.isActivity) "activity" else if (a.actionIntent.isBroadcast) "broadcast" else if (a.actionIntent.isService || a.actionIntent.isForegroundService) "service" else "other")
+                    .append(" → role=").append(pa?.role?.name ?: roleOf(a.title?.toString()).name)
+                    .append(" (").append(pa?.matchedBy ?: "title").append(")\n")
+            }
             sb.append("  extras=").append(e.keySet().sorted().joinToString()).append('\n')
             val parsed = live[sbn.key]
             sb.append("  → island: ").append(parsed?.kind?.name ?: "ignored").append("\n\n")

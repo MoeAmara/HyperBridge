@@ -74,7 +74,7 @@ object IslandStatusBar {
         try {
             val out: String = ShizukuUserServiceRecycler.executeWithService { it.runShellCommand(command) }
                 ?: "error: no result"
-            if (out.startsWith("exit=0")) {
+            if (out.startsWith("exit=0") && command.startsWith("cmd statusbar")) {
                 modified = command != CMD_RESTORE
             }
             out

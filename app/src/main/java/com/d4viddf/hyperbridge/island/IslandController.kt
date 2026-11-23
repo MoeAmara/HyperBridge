@@ -54,6 +54,15 @@ enum class IslandMode {
 fun IslandMode.isCard(): Boolean = this == IslandMode.EXPANDED || this == IslandMode.MUSIC ||
         this == IslandMode.INCOMING || this == IslandMode.TIMER_CARD || this == IslandMode.REC_CARD
 
+/** Content kind a mode stands for (used when Island Test mock buttons drive the island). */
+fun IslandMode.mockLiveKind(): LiveKind? = when (this) {
+    IslandMode.COMPACT, IslandMode.EXPANDED -> LiveKind.CALL
+    IslandMode.INCOMING, IslandMode.INCOMING_PILL -> LiveKind.INCOMING_CALL
+    IslandMode.TIMER_PILL, IslandMode.TIMER_CARD -> LiveKind.TIMER
+    IslandMode.REC_PILL, IslandMode.REC_CARD -> LiveKind.RECORDER
+    else -> null
+}
+
 /** True for the music states (real or mock music). */
 fun IslandMode.isMusic(): Boolean = this == IslandMode.MUSIC || this == IslandMode.COMPACT_MUSIC
 
@@ -163,6 +172,13 @@ object IslandLayout {
     fun wideWidthPx(g: IslandGeometry, c: IslandCalibration, density: Float): Float =
         if (c.wideWidthDp > 0f) c.wideWidthDp * density else g.screenWidthPx * WIDE_WIDTH_RATIO
 
+    /** Calibrated compact width, widened symmetrically when the live counter needs more room. */
+    fun counterPillWidthPx(g: IslandGeometry, c: IslandCalibration, density: Float): Float {
+        val base = compactWidthPx(g, c, density)
+        val need = IslandController.compactNeedPx.value
+        return max(base, need.coerceAtMost(g.screenWidthPx * 0.8f))
+    }
+
     private fun pill(g: IslandGeometry, c: IslandCalibration, density: Float, width: Float): IslandRectPx {
         val h = pillHeightPx(g, c, density)
         val r = if (c.radiusDp >= 0f) min(c.radiusDp * density, h / 2f) else h / 2f
@@ -215,8 +231,10 @@ object IslandLayout {
     fun target(mode: IslandMode, g: IslandGeometry, c: IslandCalibration, density: Float): IslandRectPx =
         when (mode) {
             IslandMode.HIDDEN -> camera(g, c, density)
-            IslandMode.COMPACT, IslandMode.COMPACT_MUSIC, IslandMode.TIMER_PILL, IslandMode.REC_PILL ->
-                pill(g, c, density, compactWidthPx(g, c, density))
+            IslandMode.COMPACT_MUSIC -> pill(g, c, density, compactWidthPx(g, c, density))
+            // Counters: wide enough for their live time (measured by the overlay), never clipped.
+            IslandMode.COMPACT, IslandMode.TIMER_PILL, IslandMode.REC_PILL ->
+                pill(g, c, density, counterPillWidthPx(g, c, density))
             IslandMode.WIDE -> pill(g, c, density, wideWidthPx(g, c, density))
             // a bit longer than the charging pill so "Incoming call" fits right of the camera
             IslandMode.INCOMING_PILL -> pill(g, c, density, min(g.screenWidthPx * 0.66f, wideWidthPx(g, c, density) * 1.15f))
@@ -370,6 +388,14 @@ object IslandController {
     /** Per-content opt-in switches: hide status-bar notification icons via Shizuku. */
     private val _iconHide = MutableStateFlow(IconHidePrefs())
     val iconHide: StateFlow<IconHidePrefs> = _iconHide.asStateFlow()
+
+    /** Width (px) the current counter pill needs for its icon + time; 0 = no counter shown. */
+    private val _compactNeedPx = MutableStateFlow(0f)
+    val compactNeedPx: StateFlow<Float> = _compactNeedPx.asStateFlow()
+
+    internal fun setCompactNeedPx(px: Float) {
+        if (kotlin.math.abs(_compactNeedPx.value - px) > 0.5f) _compactNeedPx.value = px
+    }
 
     /** Result of the last automatic status-bar command (for Island Test). */
     private val _iconHideStatus = MutableStateFlow("idle")
@@ -658,22 +684,56 @@ object IslandController {
         }
         if (live == null) return // mock card
         if (hit != null) {
-            val action = when (hit) {
-                IslandButton.ANSWER -> live.action(ActionRole.ANSWER)
-                IslandButton.DECLINE -> live.action(ActionRole.DECLINE, ActionRole.HANG_UP)
-                IslandButton.HANG_UP -> live.action(ActionRole.HANG_UP, ActionRole.DECLINE)
-                IslandButton.SPEAKER -> live.action(ActionRole.SPEAKER)
-                IslandButton.PRIMARY -> live.action(ActionRole.PAUSE, ActionRole.RESUME)
-                IslandButton.SECONDARY ->
-                    if (live.kind == LiveKind.STOPWATCH && !live.paused) live.action(ActionRole.LAP, ActionRole.STOP)
-                    else live.action(ActionRole.STOP, ActionRole.LAP, ActionRole.HANG_UP)
-                else -> null
-            }
-            if (action?.intent != null) sendPendingIntent(action.intent)
-            else if (!_locked.value) openOwnerApp()
+            performLiveButton(hit, live)
         } else if (!_locked.value) {
             openOwnerApp()
         }
+    }
+
+    /**
+     * A card button: fire the notification's own action; for calls fall back to Telecom / Shizuku;
+     * open the app only when every route is gone (and say so).
+     */
+    private fun performLiveButton(hit: IslandButton, live: IslandLive) {
+        val ctx = IslandMedia.appContext
+        val isCall = live.kind == LiveKind.CALL || live.kind == LiveKind.INCOMING_CALL
+        val action = when (hit) {
+            IslandButton.ANSWER -> live.action(ActionRole.ANSWER)
+            IslandButton.DECLINE -> live.action(ActionRole.DECLINE, ActionRole.HANG_UP)
+            IslandButton.HANG_UP -> live.action(ActionRole.HANG_UP, ActionRole.DECLINE)
+            IslandButton.SPEAKER -> live.action(ActionRole.SPEAKER)
+            IslandButton.PRIMARY ->
+                if (live.paused) live.action(ActionRole.RESUME, ActionRole.PAUSE)
+                else live.action(ActionRole.PAUSE, ActionRole.RESUME)
+            IslandButton.SECONDARY -> when (live.kind) {
+                LiveKind.STOPWATCH ->
+                    if (!live.paused) live.action(ActionRole.LAP)
+                    else live.action(ActionRole.RESET, ActionRole.STOP, ActionRole.CANCEL)
+                LiveKind.TIMER -> live.action(ActionRole.CANCEL, ActionRole.STOP, ActionRole.RESET)
+                LiveKind.RECORDER -> live.action(ActionRole.STOP)
+                else -> live.action(ActionRole.STOP, ActionRole.HANG_UP)
+            }
+            else -> null
+        }
+        if (action?.intent != null && sendPendingIntent(action.intent)) {
+            IslandCallControl.status("${hit.name}: sent action \"${action.title}\" (${action.role}, by ${action.matchedBy})")
+            return
+        }
+        val why = if (action == null) "no matching action" else "action \"${action.title}\" failed to send"
+        if (isCall && ctx != null) {
+            when (hit) {
+                IslandButton.ANSWER -> { IslandCallControl.status("ANSWER: $why → fallback"); IslandCallControl.answer(ctx, live.sbnKey); return }
+                IslandButton.DECLINE, IslandButton.HANG_UP -> {
+                    IslandCallControl.status("${hit.name}: $why → fallback"); IslandCallControl.end(ctx, live.sbnKey); return
+                }
+                IslandButton.SPEAKER -> { IslandCallControl.toggleSpeaker(ctx, live.sbnKey); return }
+                else -> {}
+            }
+        }
+        val acts = live.actions.joinToString { "\"" + it.title + "\"=" + it.role }
+        IslandCallControl.status("${hit.name} on ${live.kind}: $why → No action available, opening app. actions: [$acts]")
+        IslandCallControl.toast(ctx, "No action available")
+        if (!_locked.value) openOwnerApp()
     }
 
     /** Long-press on a pill or card: open the app that owns the content; hide while it's open. */

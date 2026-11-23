@@ -6,7 +6,9 @@ import android.net.Uri
 import android.os.Bundle
 import android.provider.Settings
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -185,6 +187,9 @@ private fun IslandTestScreen(
 
         Spacer(Modifier.height(12.dp))
         IconHideSection()
+
+        Spacer(Modifier.height(12.dp))
+        CallControlSection()
 
         Spacer(Modifier.height(12.dp))
         MusicSection(onOpenNotificationAccess)
@@ -491,7 +496,7 @@ private fun IconHideSection() {
     Text(
         "Optional, off by default. While the island shows a content whose switch is on, the notification icons " +
                 "next to the clock are hidden via Shizuku and come back when it ends. The notifications themselves stay. " +
-                "Shizuku: ${shizuku.label}. Last: $status",
+                "Mock buttons above (Compact / Incoming / Timer / Recorder) count too.",
         style = MaterialTheme.typography.bodySmall,
         color = if (granted) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.error
     )
@@ -503,6 +508,123 @@ private fun IconHideSection() {
     IconSwitchRow("Call", prefs.call, granted) { set(prefs.copy(call = it)) }
     IconSwitchRow("Timer & Stopwatch", prefs.timer, granted) { set(prefs.copy(timer = it)) }
     IconSwitchRow("Recorder", prefs.recorder, granted) { set(prefs.copy(recorder = it)) }
+    val minimal by IslandStatusMinimal.enabled.collectAsState()
+    val minimalStatus by IslandStatusMinimal.status.collectAsState()
+    LaunchedEffect(Unit) { IslandStatusMinimal.load(context) }
+    IconSwitchRow("Minimal status bar while island shows", minimal, granted) { IslandStatusMinimal.set(context, it) }
+    Text(
+        "Keeps only clock, battery and Wi-Fi (or mobile when Wi-Fi is off) while the island is visible; " +
+                "restores your exact status bar when it hides. HyperOS may ignore some icons; Xiaomi's own chips " +
+                "may stay.\nMinimal: $minimalStatus",
+        style = MaterialTheme.typography.bodySmall,
+        fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+        color = if (minimalStatus.contains("fail") || minimalStatus.contains("PENDING") || minimalStatus.contains("error"))
+            MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant
+    )
+    val scope = rememberCoroutineScope()
+    var testing by remember { mutableStateOf(false) }
+    OutlinedButton(
+        onClick = {
+            if (testing) return@OutlinedButton
+            testing = true
+            scope.launch {
+                val hide = IslandStatusBar.run(IslandStatusBar.CMD_HIDE_NOTIFICATION_ICONS)
+                IslandController.setIconHideStatus("test hide → " + hide.trim().ifEmpty { "(no output)" })
+                delay(3000)
+                val restore = IslandStatusBar.run(IslandStatusBar.CMD_RESTORE)
+                IslandController.setIconHideStatus(
+                    "test hide → " + hide.trim().ifEmpty { "(no output)" } +
+                            "\ntest restore → " + restore.trim().ifEmpty { "(no output)" }
+                )
+                testing = false
+            }
+        },
+        enabled = granted && !testing,
+        modifier = Modifier.fillMaxWidth()
+    ) { Text(if (testing) "Testing… icons should be hidden for 3 s" else "Test now (hide 3 s, then restore)") }
+    Text(
+        "Shizuku: ${shizuku.label}\nLast command: $status\n" +
+                "exit=0 but icons still visible = HyperOS ignores this flag. An error line = Shizuku/binding problem.",
+        style = MaterialTheme.typography.bodySmall,
+        fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+        color = if (granted && !status.startsWith("error") && !status.contains("→ error"))
+            MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.error
+    )
+}
+
+@Composable
+private fun CallControlSection() {
+    val context = LocalContext.current
+    var granted by remember { mutableStateOf(IslandCallControl.hasPermission(context)) }
+    var shizuku by remember { mutableStateOf(IslandStatusBar.ShizukuState.NOT_RUNNING) }
+    LaunchedEffect(Unit) {
+        IslandCallControl.loadHidePopup(context)
+        while (true) {
+            granted = IslandCallControl.hasPermission(context)
+            shizuku = IslandStatusBar.state()
+            delay(1500)
+        }
+    }
+    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted = it }
+    val actionStatus by IslandCallControl.actionStatus.collectAsState()
+    val hidePopup by IslandCallControl.hidePopup.collectAsState()
+    val popupStatus by IslandCallControl.popupStatus.collectAsState()
+    val shizukuOk = shizuku == IslandStatusBar.ShizukuState.GRANTED
+
+    Text("Buttons & calls", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+    Text(
+        "Card buttons fire the notification's own action. Calls without a usable action use call control " +
+                "(answer / end), then Shizuku key events. The app opens only if nothing works.",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant
+    )
+    Text(
+        "Call control: " + if (granted) "granted" else "not granted",
+        style = MaterialTheme.typography.bodyMedium,
+        color = if (granted) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error
+    )
+    if (!granted) {
+        OutlinedButton(
+            onClick = { launcher.launch(android.Manifest.permission.ANSWER_PHONE_CALLS) },
+            modifier = Modifier.fillMaxWidth()
+        ) { Text("Grant call control") }
+    }
+    Text(
+        "Last button: $actionStatus",
+        style = MaterialTheme.typography.bodySmall,
+        fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+        color = if (actionStatus.contains("FAILED") || actionStatus.contains("No action"))
+            MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant
+    )
+
+    Spacer(Modifier.height(8.dp))
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Text(
+            "Hide system incoming-call popup (Shizuku)",
+            modifier = Modifier.weight(1f),
+            style = MaterialTheme.typography.bodyMedium
+        )
+        Switch(
+            checked = hidePopup,
+            enabled = shizukuOk || hidePopup,
+            onCheckedChange = { IslandCallControl.setHidePopup(context, it) }
+        )
+    }
+    Text(
+        "Off by default. While a call rings, heads-up notifications are turned off for the whole phone " +
+                "(other pop-ups won't show either during the ring) and restored to the previous value as soon " +
+                "as the ring ends. If the original popup still shows, HyperOS draws it as a separate window, " +
+                "not a heads-up, and this can't hide it.",
+        style = MaterialTheme.typography.bodySmall,
+        color = if (shizukuOk) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.error
+    )
+    Text(
+        "Shizuku: ${shizuku.label}\nPopup: $popupStatus",
+        style = MaterialTheme.typography.bodySmall,
+        fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+        color = if (popupStatus.contains("fail") || popupStatus.contains("PENDING") || popupStatus.contains("error"))
+            MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant
+    )
 }
 
 @Composable
