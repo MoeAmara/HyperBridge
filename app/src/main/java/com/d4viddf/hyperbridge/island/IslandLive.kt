@@ -65,7 +65,9 @@ data class IslandLive(
     /** Timer: full length in ms (from the notification, else the largest remaining time seen). */
     val totalMs: Long? = null,
     /** The phone's own full-screen call UI (incoming calls). */
-    val fullScreenIntent: PendingIntent? = null
+    val fullScreenIntent: PendingIntent? = null,
+    /** Call we placed that the other side hasn't answered yet (dialing / ringing there). */
+    val outgoing: Boolean = false
 ) {
     fun action(vararg roles: ActionRole): LiveAction? =
         roles.firstNotNullOfOrNull { r -> actions.firstOrNull { it.role == r } }
@@ -101,6 +103,29 @@ data class IslandLive(
         if (base != null && !paused && !countDown) return (nowMs - base).coerceAtLeast(0L)
         return fixedTime?.let { parseClockMs(it) }
     }
+}
+
+/** At most the first two words of a name ("Mohamed Ahmed Ali" -> "Mohamed Ahmed"); numbers stay whole. */
+fun firstTwoWords(name: String): String {
+    val t = name.trim()
+    if (looksLikeNumber(t)) return t
+    val w = t.split(Regex("\\s+")).filter { it.isNotEmpty() }
+    return if (w.size <= 2) t else w[0] + " " + w[1]
+}
+
+/** True when a title is a phone number rather than a name. */
+fun looksLikeNumber(s: String): Boolean {
+    val t = s.trim()
+    if (t.isEmpty()) return false
+    var digits = 0
+    for (ch in t) {
+        when {
+            ch.isDigit() -> digits++
+            ch == '+' || ch == ' ' || ch == '-' || ch == '(' || ch == ')' || ch == '.' || ch == '\u200E' || ch == '\u200F' || ch == '\u202A' || ch == '\u202C' -> {}
+            else -> return false
+        }
+    }
+    return digits >= 3
 }
 
 /** "mm:ss" / "h:mm:ss" -> ms. */
@@ -173,6 +198,20 @@ object IslandNotifications {
         "com.miui.screenrecorder", "com.sec.android.app.voicenote"
     )
 
+    /** Call notifications we already saw connected (a running clock): never "outgoing" again. */
+    private val answeredKeys = HashSet<String>()
+
+    /** Recorder notifications that belong to a call recording: ignored until they go away. */
+    private val callRecKeys = HashSet<String>()
+
+    private val CALL_RECORDER_PACKAGES = setOf(
+        "com.android.incallui", "com.android.phone", "com.android.server.telecom", "com.miui.callrecorder",
+        "com.android.callrecorder", "com.google.android.dialer", "com.android.dialer"
+    )
+
+    /** number -> contact name (null = looked up, not found). */
+    private val contactCache = HashMap<String, String?>()
+
     fun onListenerConnected(service: NotificationListenerService) {
         listener = service
         val all = try { service.activeNotifications } catch (_: Exception) { null } ?: return
@@ -206,8 +245,10 @@ object IslandNotifications {
         synchronized(clocks) {
             clocks.remove(sbn.key)
             timerTotals.remove(sbn.key)
+            answeredKeys.remove(sbn.key)
         }
         main.post {
+            callRecKeys.remove(sbn.key)
             if (live.remove(sbn.key) != null) publish()
         }
     }
@@ -218,7 +259,13 @@ object IslandNotifications {
 
     private fun publish() {
         _ringing.value = live.values.any { it.kind == LiveKind.INCOMING_CALL }
-        IslandController.setLive(live.values.toList())
+        // Call recording: a recorder that runs while a call is live (or comes from the phone app)
+        // gets no island, no bubble, no icon hiding — and stays ignored until it goes away.
+        val callOn = live.values.any { it.kind == LiveKind.CALL || it.kind == LiveKind.INCOMING_CALL }
+        for (l in live.values) {
+            if (l.kind == LiveKind.RECORDER && (callOn || l.packageName in CALL_RECORDER_PACKAGES)) callRecKeys += l.sbnKey
+        }
+        IslandController.setLive(live.values.filter { !(it.kind == LiveKind.RECORDER && it.sbnKey in callRecKeys) })
     }
 
     /** Main thread only: is a live activity with this notification key still of one of [kinds]? */
@@ -264,6 +311,10 @@ object IslandNotifications {
                     if (incoming) LiveKind.INCOMING_CALL else LiveKind.CALL
                 }
             }
+            // A recorder notification that says it records a call: never an island.
+            (pkg in RECORDER_PACKAGES || (ongoing && showChrono && (hay.contains("record") || hay.contains("تسجيل")))) &&
+                    (pkg in CALL_RECORDER_PACKAGES || (hay.contains("call") && hay.contains("record")) ||
+                            hay.contains("مكالم")) -> null
             pkg in RECORDER_PACKAGES && ongoing -> LiveKind.RECORDER
             ongoing && showChrono && (hay.contains("record") || hay.contains("تسجيل")) -> LiveKind.RECORDER
             category == "stopwatch" && ongoing -> LiveKind.STOPWATCH
@@ -376,12 +427,30 @@ object IslandNotifications {
         }
 
         var displayTitle = title
+        var outgoing = false
         if (kind == LiveKind.CALL || kind == LiveKind.INCOMING_CALL) {
             val person: Person? = try {
                 if (Build.VERSION.SDK_INT >= 33) extras.getParcelable(Notification.EXTRA_CALL_PERSON, Person::class.java)
                 else @Suppress("DEPRECATION") (extras.getParcelable(Notification.EXTRA_CALL_PERSON) as? Person)
             } catch (_: Exception) { null }
             person?.name?.toString()?.takeIf { it.isNotBlank() }?.let { displayTitle = it }
+            if (looksLikeNumber(displayTitle)) contactName(context, displayTitle)?.let { displayTitle = it }
+        }
+        if (kind == LiveKind.CALL) {
+            // Outgoing, not answered yet: a "dialing / calling" word, or an ongoing call with no clock at all.
+            val sub = extras.getCharSequence(Notification.EXTRA_SUB_TEXT)?.toString() ?: ""
+            val words = norm("$title $text $sub")
+            val wifiCalling = words.contains("wi-fi calling") || words.contains("wifi calling") || words.contains("wlan call")
+            val dialHint = !wifiCalling && OUTGOING_HINTS.any { words.contains(norm(it)) }
+            val hasClock = chronoBase != null || fixedTime != null
+            synchronized(clocks) {
+                if (hasClock && !dialHint) answeredKeys += sbn.key
+                outgoing = sbn.key !in answeredKeys && (dialHint || (callType == 2 && !hasClock) || (callType == 0 && !hasClock && pkg in CALL_PACKAGES))
+            }
+            if (outgoing) {
+                chronoBase = null
+                fixedTime = null
+            }
         }
 
         val avatar = if (kind == LiveKind.CALL || kind == LiveKind.INCOMING_CALL) {
@@ -404,8 +473,33 @@ object IslandNotifications {
             contentIntent = n.contentIntent,
             postTime = sbn.postTime,
             totalMs = totalMs,
-            fullScreenIntent = n.fullScreenIntent
+            fullScreenIntent = n.fullScreenIntent,
+            outgoing = outgoing
         )
+    }
+
+    private val OUTGOING_HINTS = listOf(
+        "dialing", "dialling", "calling…", "calling...", "calling ", "outgoing", "connecting", "ringing",
+        "جار الاتصال", "جاري الاتصال", "جارٍ الاتصال", "يتصل", "يتم الاتصال", "اتصال صادر", "مكالمه صادره",
+        "جار الطلب", "جاري الطلب", "يرن", "جار الرنين"
+    )
+
+    /** Contact name for a phone number (READ_CONTACTS needed; null when not granted / not saved). */
+    private fun contactName(context: Context, number: String): String? {
+        synchronized(contactCache) { if (contactCache.containsKey(number)) return contactCache[number] }
+        if (context.checkSelfPermission(android.Manifest.permission.READ_CONTACTS) != android.content.pm.PackageManager.PERMISSION_GRANTED) return null
+        val name = try {
+            val uri = android.net.Uri.withAppendedPath(
+                android.provider.ContactsContract.PhoneLookup.CONTENT_FILTER_URI,
+                android.net.Uri.encode(number.filter { it.isDigit() || it == '+' })
+            )
+            context.contentResolver.query(uri, arrayOf(android.provider.ContactsContract.PhoneLookup.DISPLAY_NAME), null, null, null)
+                ?.use { c -> if (c.moveToFirst()) c.getString(0)?.takeIf { it.isNotBlank() } else null }
+        } catch (e: Exception) {
+            Log.w(TAG, "contact lookup failed", e); null
+        }
+        synchronized(contactCache) { contactCache[number] = name }
+        return name
     }
 
     private fun Notification.usesChronometerCompat(): Boolean =
@@ -569,7 +663,14 @@ object IslandNotifications {
             }
             sb.append("  extras=").append(e.keySet().sorted().joinToString()).append('\n')
             val parsed = live[sbn.key]
-            sb.append("  → island: ").append(parsed?.kind?.name ?: "ignored").append("\n\n")
+            sb.append("  → island: ").append(
+                when {
+                    parsed == null -> "ignored"
+                    parsed.kind == LiveKind.RECORDER && sbn.key in callRecKeys -> "ignored (call recording)"
+                    parsed.outgoing -> parsed.kind.name + " (outgoing, name=\"" + firstTwoWords(parsed.title) + "\")"
+                    else -> parsed.kind.name
+                }
+            ).append("\n\n")
         }
         if (count == 0) sb.append("No ongoing notifications right now.")
         return sb.toString()

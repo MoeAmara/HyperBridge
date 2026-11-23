@@ -175,6 +175,10 @@ private fun IslandTestScreen(
             StateButton("Incoming", Modifier.weight(1f)) { IslandController.show(IslandMode.INCOMING_PILL) }
         }
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            StateButton("Outgoing call", Modifier.weight(1f)) { IslandController.show(IslandMode.COMPACT, outgoing = true) }
+            StateButton("Call (answered)", Modifier.weight(1f)) { IslandController.show(IslandMode.COMPACT) }
+        }
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             StateButton("Timer", Modifier.weight(1f)) { IslandController.show(IslandMode.TIMER_PILL) }
             StateButton("Recorder", Modifier.weight(1f)) { IslandController.show(IslandMode.REC_PILL) }
         }
@@ -223,7 +227,13 @@ private fun IslandTestScreen(
         IconHideSection()
 
         Spacer(Modifier.height(12.dp))
+        CallStatusBarSection()
+
+        Spacer(Modifier.height(12.dp))
         CallControlSection()
+
+        Spacer(Modifier.height(12.dp))
+        OutgoingCallSection()
 
         Spacer(Modifier.height(12.dp))
         MusicSection(onOpenNotificationAccess)
@@ -592,6 +602,7 @@ private fun IconHideSection() {
                     "test hide → " + hide.trim().ifEmpty { "(no output)" } +
                             "\ntest restore → " + restore.trim().ifEmpty { "(no output)" }
                 )
+                IslandController.recheckIcons()
                 testing = false
             }
         },
@@ -642,6 +653,21 @@ private fun CallControlSection() {
             modifier = Modifier.fillMaxWidth()
         ) { Text("Grant call control") }
     }
+    var contacts by remember {
+        mutableStateOf(context.checkSelfPermission(android.Manifest.permission.READ_CONTACTS) == android.content.pm.PackageManager.PERMISSION_GRANTED)
+    }
+    val contactsLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { contacts = it }
+    Text(
+        "Contacts (names instead of numbers on the call pill): " + if (contacts) "granted" else "not granted",
+        style = MaterialTheme.typography.bodyMedium,
+        color = if (contacts) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error
+    )
+    if (!contacts) {
+        OutlinedButton(
+            onClick = { contactsLauncher.launch(android.Manifest.permission.READ_CONTACTS) },
+            modifier = Modifier.fillMaxWidth()
+        ) { Text("Grant contacts") }
+    }
     Text(
         "Last button: $actionStatus",
         style = MaterialTheme.typography.bodySmall,
@@ -657,6 +683,178 @@ private fun CallControlSection() {
     )
 }
 
+
+/** Outgoing call pill look: glow on/off + strength (Layout-style controls). */
+@Composable
+private fun OutgoingCallSection() {
+    val context = LocalContext.current
+    val l by IslandController.look.collectAsState()
+    fun set(n: IslandLook) {
+        IslandController.setLook(n)
+        IslandCalibrationStore.saveLook(context, n)
+    }
+    Text("Outgoing call pill", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+    Text(
+        "While the other side is ringing, the call pill shows the person's name (first two words; the number when " +
+                "it isn't a saved contact) with a soft breathing glow, a light sweep and rings from the phone icon. " +
+                "When they answer it becomes the normal timer pill. Try it with \"Outgoing call\" above.",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant
+    )
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Text("Glow animation", modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
+        Switch(checked = l.outgoingGlow, onCheckedChange = { set(l.copy(outgoingGlow = it)) })
+    }
+    if (l.outgoingGlow) {
+        CalRow("Glow strength", l.outgoingGlowAmount * 100f, 10f, 100f, 5f, "%") { set(l.copy(outgoingGlowAmount = it / 100f)) }
+    }
+}
+
+/**
+ * Status bar during calls: hide the clock / the whole status bar while a call is live, find a chip-like
+ * disable flag in `cmd statusbar help`, and search Xiaomi's hidden settings for call / chip keys (read only).
+ */
+@Composable
+private fun CallStatusBarSection() {
+    val context = LocalContext.current
+    val prefs by IslandController.iconHide.collectAsState()
+    val status by IslandController.iconHideStatus.collectAsState()
+    var shizuku by remember { mutableStateOf(IslandStatusBar.ShizukuState.NOT_RUNNING) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            shizuku = IslandStatusBar.state()
+            delay(1500)
+        }
+    }
+    fun set(n: IconHidePrefs) {
+        IslandController.setIconHide(n)
+        IslandCalibrationStore.saveIconHide(context, n)
+    }
+    val granted = shizuku == IslandStatusBar.ShizukuState.GRANTED
+    val scope = rememberCoroutineScope()
+    var busy by remember { mutableStateOf(false) }
+    var out by remember { mutableStateOf("") }
+
+    fun test(label: String, flags: String) {
+        if (busy) return
+        busy = true
+        scope.launch {
+            val h = IslandStatusBar.run("cmd statusbar send-disable-flag $flags")
+            out = "$label → ${h.trim().ifEmpty { "(no output)" }}"
+            delay(3000)
+            val r = IslandStatusBar.run(IslandStatusBar.CMD_RESTORE)
+            out += "\nrestore → ${r.trim().ifEmpty { "(no output)" }}"
+            IslandController.recheckIcons()
+            busy = false
+        }
+    }
+
+    Text("Status bar during calls", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+    Text(
+        "Optional, off by default, via Shizuku. Active while any call is live (incoming, outgoing or ongoing); " +
+                "everything comes back when the call ends. The island stays visible.",
+        style = MaterialTheme.typography.bodySmall,
+        color = if (granted) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.error
+    )
+    if (shizuku == IslandStatusBar.ShizukuState.PERMISSION_NEEDED) {
+        OutlinedButton(onClick = { IslandStatusBar.requestPermission() }, modifier = Modifier.fillMaxWidth()) {
+            Text("Grant Shizuku permission")
+        }
+    }
+    IconSwitchRow("Hide entire status bar during calls", prefs.allCalls, granted) { set(prefs.copy(allCalls = it)) }
+    IconSwitchRow("Hide clock during calls (the call chip may go with it)", prefs.clockCalls, granted) { set(prefs.copy(clockCalls = it)) }
+    IconSwitchRow(
+        if (prefs.chipFlag.isBlank()) "Hide call chip (no chip flag found yet — run step 1)"
+        else "Hide call chip with flag \"${prefs.chipFlag}\"",
+        prefs.chipCalls, granted && prefs.chipFlag.isNotBlank()
+    ) { set(prefs.copy(chipCalls = it)) }
+
+    Text("Find a way to hide the call chip", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
+    OutlinedButton(
+        onClick = {
+            if (busy) return@OutlinedButton
+            busy = true
+            scope.launch {
+                val help = IslandStatusBar.run("cmd statusbar help")
+                val known = setOf(
+                    "search", "home", "recents", "notification-alerts", "statusbar-expansion", "system-icons",
+                    "clock", "notification-icons", "none", "send-disable-flag", "disable-flag"
+                )
+                val candidates = Regex("[a-z][a-z0-9_-]{2,}").findAll(help.lowercase()).map { it.value }
+                    .filter { it !in known && (it.contains("chip") || it.contains("ongoing")) }
+                    .distinct().toList()
+                val found = candidates.firstOrNull { it.contains("chip") } ?: candidates.firstOrNull() ?: ""
+                set(prefs.copy(chipFlag = found, chipCalls = if (found.isBlank()) false else prefs.chipCalls))
+                out = "1) cmd statusbar help\nchip-like flags: " + (if (candidates.isEmpty()) "none found" else candidates.joinToString()) +
+                        "\nusing: " + found.ifBlank { "(none)" } + "\n\n" + help.trim()
+                busy = false
+            }
+        },
+        enabled = granted && !busy,
+        modifier = Modifier.fillMaxWidth()
+    ) { Text("1) Show status bar flags (cmd statusbar help)") }
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+        OutlinedButton(onClick = { test("2) hide clock", "clock") }, enabled = granted && !busy, modifier = Modifier.weight(1f)) {
+            Text("2) Test: hide clock 3 s")
+        }
+        OutlinedButton(
+            onClick = { test("hide entire status bar", "clock system-icons notification-icons") },
+            enabled = granted && !busy, modifier = Modifier.weight(1f)
+        ) { Text("Test: whole bar 3 s") }
+    }
+    if (prefs.chipFlag.isNotBlank()) {
+        OutlinedButton(
+            onClick = { test("chip flag ${prefs.chipFlag}", prefs.chipFlag) },
+            enabled = granted && !busy, modifier = Modifier.fillMaxWidth()
+        ) { Text("Test chip flag \"${prefs.chipFlag}\" 3 s") }
+    }
+    OutlinedButton(
+        onClick = {
+            if (busy) return@OutlinedButton
+            busy = true
+            scope.launch {
+                val re = Regex("call|chip|focus|island|capsule|ongoing|status_bar|statusbar|promoted|strong_toast|notch", RegexOption.IGNORE_CASE)
+                val sb = StringBuilder("3) Xiaomi settings search (read only, nothing changed)\n")
+                for (table in listOf("system", "secure", "global")) {
+                    val r = IslandStatusBar.run("settings list $table")
+                    if (!r.startsWith("exit=0")) {
+                        sb.append("\n[$table] ").append(r.lineSequence().firstOrNull() ?: r).append('\n')
+                        continue
+                    }
+                    val hits = r.lineSequence().drop(1).filter { line -> re.containsMatchIn(line.substringBefore('=')) }.toList()
+                    sb.append("\n[$table] ").append(hits.size).append(" matches\n")
+                    hits.forEach { sb.append(it).append('\n') }
+                }
+                out = sb.toString()
+                busy = false
+            }
+        },
+        enabled = granted && !busy,
+        modifier = Modifier.fillMaxWidth()
+    ) { Text("3) Search Xiaomi settings (call / chip / focus / island…)") }
+    if (out.isNotEmpty()) {
+        OutlinedButton(
+            onClick = {
+                val cm = context.getSystemService(ClipboardManager::class.java)
+                cm?.setPrimaryClip(ClipData.newPlainText("Island status bar", out))
+            },
+            modifier = Modifier.fillMaxWidth()
+        ) { Text("Copy result") }
+        Text(
+            out.take(6000) + if (out.length > 6000) "\n… (cut here — Copy result has all of it)" else "",
+            style = MaterialTheme.typography.bodySmall,
+            fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+    }
+    Text(
+        "Shizuku: ${shizuku.label}\nLast auto command: $status",
+        style = MaterialTheme.typography.bodySmall,
+        fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+        color = if (granted && !status.startsWith("error") && !status.contains("→ error"))
+            MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.error
+    )
+}
 
 @Composable
 private fun IconSwitchRow(label: String, checked: Boolean, granted: Boolean, onChange: (Boolean) -> Unit) {

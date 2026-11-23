@@ -191,7 +191,11 @@ data class IslandLook(
     /** While a card is open, the bubble glows softly in its own colour. */
     val bubbleGlow: Boolean = true,
     /** Blur follows the card per frame by moving its view (smooth); false = resize the window (fallback). */
-    val blurFollowView: Boolean = true
+    val blurFollowView: Boolean = true,
+    /** Outgoing call pill (ringing on the other side): soft breathing glow + light sweep + rings. */
+    val outgoingGlow: Boolean = true,
+    /** Strength of that glow, 0..1. */
+    val outgoingGlowAmount: Float = 0.7f
 )
 
 /**
@@ -217,8 +221,23 @@ data class IconHidePrefs(
     val timer: Boolean = false,
     val recorder: Boolean = false,
     /** Hide whenever two activities run at once (pill + bubble), whatever they are. */
-    val multi: Boolean = false
+    val multi: Boolean = false,
+    /** During any call: hide the clock too (the call chip sits in the clock area, may go with it). */
+    val clockCalls: Boolean = false,
+    /** During any call: hide the whole status bar (clock + system icons + notification icons). */
+    val allCalls: Boolean = false,
+    /** During any call: also send this extra disable flag found in `cmd statusbar help` (chip-like). */
+    val chipCalls: Boolean = false,
+    /** The chip-like flag name found on this phone ("" = none found). */
+    val chipFlag: String = ""
 ) {
+    /** The `send-disable-flag` flags wanted while a call is live (empty = nothing extra). */
+    fun callFlags(): Set<String> = buildSet {
+        if (allCalls) { add("clock"); add("system-icons"); add("notification-icons") }
+        if (clockCalls) add("clock")
+        if (chipCalls && chipFlag.isNotBlank()) add(chipFlag)
+    }
+
     fun wants(kind: LiveKind?): Boolean = when (kind) {
         LiveKind.CALL, LiveKind.INCOMING_CALL -> call
         LiveKind.TIMER, LiveKind.STOPWATCH -> timer
@@ -605,7 +624,9 @@ object IslandCalibrationStore {
             tint = p.getFloat("look.tint", d.tint),
             solid = p.getBoolean("look.solid", d.solid),
             bubbleGlow = p.getBoolean("look.bubbleGlow", d.bubbleGlow),
-            blurFollowView = p.getBoolean("look.blurFollowView", d.blurFollowView)
+            blurFollowView = p.getBoolean("look.blurFollowView", d.blurFollowView),
+            outgoingGlow = p.getBoolean("look.outgoingGlow", d.outgoingGlow),
+            outgoingGlowAmount = p.getFloat("look.outgoingGlowAmount", d.outgoingGlowAmount)
         )
     }
 
@@ -616,6 +637,8 @@ object IslandCalibrationStore {
             .putBoolean("look.solid", l.solid)
             .putBoolean("look.bubbleGlow", l.bubbleGlow)
             .putBoolean("look.blurFollowView", l.blurFollowView)
+            .putBoolean("look.outgoingGlow", l.outgoingGlow)
+            .putFloat("look.outgoingGlowAmount", l.outgoingGlowAmount)
             .apply()
     }
 
@@ -657,6 +680,7 @@ object IslandCalibrationStore {
         o.put("look", org.json.JSONObject().apply {
             put("blurDp", l.blurDp.toDouble()); put("tint", l.tint.toDouble()); put("solid", l.solid)
             put("bubbleGlow", l.bubbleGlow); put("blurFollowView", l.blurFollowView)
+            put("outgoingGlow", l.outgoingGlow); put("outgoingGlowAmount", l.outgoingGlowAmount.toDouble())
         })
         return o.toString(2)
     }
@@ -699,7 +723,8 @@ object IslandCalibrationStore {
         val lj = o.optJSONObject("look")
         val l = if (lj == null) l0 else IslandLook(
             lj.f("blurDp", l0.blurDp), lj.f("tint", l0.tint), lj.optBoolean("solid", l0.solid),
-            lj.optBoolean("bubbleGlow", l0.bubbleGlow), lj.optBoolean("blurFollowView", l0.blurFollowView)
+            lj.optBoolean("bubbleGlow", l0.bubbleGlow), lj.optBoolean("blurFollowView", l0.blurFollowView),
+            lj.optBoolean("outgoingGlow", l0.outgoingGlow), lj.f("outgoingGlowAmount", l0.outgoingGlowAmount)
         )
         return Triple(c, m, l)
     }
@@ -746,7 +771,11 @@ object IslandCalibrationStore {
             call = p.getBoolean("hideIconsCall", false),
             timer = p.getBoolean("hideIconsTimer", false),
             recorder = p.getBoolean("hideIconsRecorder", false),
-            multi = p.getBoolean("hideIconsMulti", false)
+            multi = p.getBoolean("hideIconsMulti", false),
+            clockCalls = p.getBoolean("hideClockCalls", false),
+            allCalls = p.getBoolean("hideAllCalls", false),
+            chipCalls = p.getBoolean("hideChipCalls", false),
+            chipFlag = p.getString("chipFlag", "") ?: ""
         )
     }
 
@@ -756,6 +785,10 @@ object IslandCalibrationStore {
             .putBoolean("hideIconsTimer", v.timer)
             .putBoolean("hideIconsRecorder", v.recorder)
             .putBoolean("hideIconsMulti", v.multi)
+            .putBoolean("hideClockCalls", v.clockCalls)
+            .putBoolean("hideAllCalls", v.allCalls)
+            .putBoolean("hideChipCalls", v.chipCalls)
+            .putString("chipFlag", v.chipFlag)
             .apply()
     }
 }
@@ -867,6 +900,18 @@ object IslandController {
 
     /** Island Test / Layout screen: the mock timer pill / card is a stopwatch. */
     private val _mockStopwatch = MutableStateFlow(false)
+
+    /** Island Test: the mock call pill is an outgoing call (name + glow instead of the timer). */
+    private val _mockOutgoing = MutableStateFlow(false)
+    val mockOutgoing: StateFlow<Boolean> = _mockOutgoing.asStateFlow()
+
+    /** Bumped when Island Test ran a status-bar command by hand, so the service re-sends its flags. */
+    private val _iconRecheck = MutableStateFlow(0)
+    val iconRecheck: StateFlow<Int> = _iconRecheck.asStateFlow()
+
+    fun recheckIcons() {
+        _iconRecheck.value = _iconRecheck.value + 1
+    }
 
     /** The Layout screen is previewing: small pill -> small pill switches resize directly on the island spring. */
     private val _layoutPreview = MutableStateFlow(false)
@@ -1106,7 +1151,7 @@ object IslandController {
     // ---- Test buttons ----------------------------------------------------------------------
 
     /** Test buttons: show a mock state ([stopwatch] = the mock timer is a stopwatch). */
-    fun show(mode: IslandMode, stopwatch: Boolean = false) {
+    fun show(mode: IslandMode, stopwatch: Boolean = false, outgoing: Boolean = false) {
         if (mode == IslandMode.HIDDEN) {
             hide()
             return
@@ -1115,6 +1160,7 @@ object IslandController {
         _restorable.value = null
         mockBubble = null
         _mockStopwatch.value = stopwatch
+        _mockOutgoing.value = outgoing
         seen = activities().map { it.id }.toSet()
         setMode(mode, null, emptyList())
         updateBubble()

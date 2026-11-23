@@ -87,6 +87,9 @@ class IslandAccessibilityService : AccessibilityService(), LifecycleOwner, ViewM
     /** Bumped on screen-on: re-check the status-bar flags (SystemUI may have reset them). */
     private val iconRecheck = MutableStateFlow(0)
 
+    /** The disable flags the service last applied ("" = none / restored). */
+    private var appliedFlags: String = ""
+
     /** True while WE (the automatic hide) have the notification icons hidden. */
     @Volatile
     private var iconsHiddenByUs = false
@@ -182,41 +185,60 @@ class IslandAccessibilityService : AccessibilityService(), LifecycleOwner, ViewM
     private fun startIconHide() {
         iconJob?.cancel()
         iconJob = lifecycleScope.launch {
-            var lastTick = iconRecheck.value
+            var lastTick = -1
+            // Any call live right now (real, or a mock call pill from Island Test) — for the "during calls" options.
+            val callActive = combine(IslandController.live, IslandController.mode, IslandController.shownLive) { list, m, l ->
+                list.any { it.kind == LiveKind.CALL || it.kind == LiveKind.INCOMING_CALL } ||
+                        (l == null && m != IslandMode.HIDDEN &&
+                                (m.mockLiveKind() == LiveKind.CALL || m.mockLiveKind() == LiveKind.INCOMING_CALL))
+            }.distinctUntilChanged()
+            val ticks = combine(iconRecheck, IslandController.iconRecheck) { a, b -> a + b }
             combine(
-                IslandController.mode,
-                IslandController.shownLive,
-                IslandController.iconHide,
-                iconRecheck,
-                IslandController.bubble
-            ) { m, l, prefs, tick, b ->
-                // Only the KIND matters: the live object changes every second (timer / recorder
-                // ticks), which used to cancel the debounce below before the command could run.
-                // "Two activities at once": a second content shown as the bubble beside the pill / card.
-                val two = prefs.multi && b != null
-                Pair(m != IslandMode.HIDDEN && (prefs.wants(l?.kind ?: m.mockLiveKind()) || two), tick)
+                combine(
+                    IslandController.mode,
+                    IslandController.shownLive,
+                    IslandController.iconHide,
+                    IslandController.bubble
+                ) { m, l, prefs, b ->
+                    // Only the KIND matters: the live object changes every second (timer / recorder
+                    // ticks), which used to cancel the debounce below before the command could run.
+                    // "Two activities at once": a second content shown as the bubble beside the pill / card.
+                    val two = prefs.multi && b != null
+                    Pair(m != IslandMode.HIDDEN && (prefs.wants(l?.kind ?: m.mockLiveKind()) || two), prefs)
+                }.distinctUntilChanged(),
+                callActive,
+                ticks
+            ) { (icons, prefs), call, tick ->
+                // One union of every reason: send-disable-flag replaces the whole set each time.
+                val flags = sortedSetOf<String>()
+                if (icons) flags += "notification-icons"
+                if (call) flags += prefs.callFlags()
+                Pair(flags.joinToString(" "), tick)
             }
                 .distinctUntilChanged()
-                .collectLatest { (want, tick) ->
-                    val recheck = tick != lastTick
+                .collectLatest { (flags, tick) ->
+                    val recheck = lastTick != -1 && tick != lastTick
                     lastTick = tick
-                    if (!recheck && want == iconsHiddenByUs) return@collectLatest
-                    if (!want && !iconsHiddenByUs) return@collectLatest
-                    delay(if (want) 150L else 600L)
+                    if (!recheck && flags == appliedFlags) return@collectLatest
+                    if (flags.isEmpty() && appliedFlags.isEmpty() && !IslandStatusBar.modified) return@collectLatest
+                    delay(if (flags.isNotEmpty()) 150L else 600L)
                     val state = IslandStatusBar.state()
                     if (state != IslandStatusBar.ShizukuState.GRANTED) {
                         IslandController.setIconHideStatus("error: skipped (" + state.label + ")")
                         return@collectLatest
                     }
-                    val cmd = if (want) IslandStatusBar.CMD_HIDE_NOTIFICATION_ICONS else IslandStatusBar.CMD_RESTORE
+                    val cmd = if (flags.isEmpty()) IslandStatusBar.CMD_RESTORE else "cmd statusbar send-disable-flag $flags"
                     val out = try {
                         IslandStatusBar.run(cmd)
                     } catch (e: Throwable) {
                         "error: ${e.javaClass.simpleName}: ${e.message}"
                     }
-                    if (out.startsWith("exit=0")) iconsHiddenByUs = want
+                    if (out.startsWith("exit=0")) {
+                        appliedFlags = flags
+                        iconsHiddenByUs = flags.isNotEmpty()
+                    }
                     IslandController.setIconHideStatus(
-                        (if (want) "auto hide" else "auto restore") + " → " + out.trim().ifEmpty { "(no output)" }
+                        (if (flags.isNotEmpty()) "auto hide [$flags]" else "auto restore") + " → " + out.trim().ifEmpty { "(no output)" }
                     )
                 }
         }

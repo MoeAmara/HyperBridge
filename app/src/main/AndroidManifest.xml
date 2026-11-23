@@ -11,6 +11,7 @@
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <!-- Island: answer / end calls from the island when the call notification has no action. -->
+    <uses-permission android:name="android.permission.READ_CONTACTS" />
     <uses-permission android:name="android.permission.ANSWER_PHONE_CALLS" />
     <!-- Island: minimal status bar keeps Wi-Fi or mobile depending on the active network. -->
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />

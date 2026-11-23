@@ -3,6 +3,8 @@ package com.d4viddf.hyperbridge.island
 import android.os.SystemClock
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.AnimationSpec
+import androidx.compose.animation.core.CubicBezierEasing
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
@@ -1088,11 +1090,20 @@ private fun pillTextSp(default: Float): TextUnit = (LocalPillFrame.current?.text
 private fun pillTimeText(mode: IslandMode, live: IslandLive?, mockSeconds: Int): String? {
     val now = System.currentTimeMillis()
     return when (mode) {
-        IslandMode.COMPACT -> if (live == null) formatClock(mockSeconds) else live.timeText(now) ?: live.text.ifBlank { "Call" }
+        IslandMode.COMPACT -> callPillText(live, mockSeconds, IslandController.mockOutgoing.value, now)
         IslandMode.TIMER_PILL -> timerText(live, now, mockSeconds, live?.kind == LiveKind.STOPWATCH)
         IslandMode.REC_PILL -> recText(live, now, formatClock(mockSeconds))
         else -> null
     }
+}
+
+private const val MOCK_OUTGOING_NAME = "Mohamed Ahmed Ali"
+
+/** Right side of the call pill: the timer, or (outgoing, not answered yet) the first two words of the name. */
+private fun callPillText(live: IslandLive?, mockSeconds: Int, mockOutgoing: Boolean, now: Long): String = when {
+    live == null -> if (mockOutgoing) firstTwoWords(MOCK_OUTGOING_NAME) else formatClock(mockSeconds)
+    live.outgoing -> firstTwoWords(live.title.ifBlank { live.text.ifBlank { "Calling" } })
+    else -> live.timeText(now) ?: live.text.ifBlank { "Call" }
 }
 
 /** Width of the left-hand icon / waveform of a counter pill ([iconDp] = icon size / waveform height). */
@@ -1202,13 +1213,22 @@ private fun CardFrame(content: @Composable () -> Unit) {
 @Composable
 private fun CompactCallContent(live: IslandLive?, mockTime: String) {
     val now = rememberNow()
+    val mockOutgoing by IslandController.mockOutgoing.collectAsState()
+    val look by IslandController.look.collectAsState()
+    val outgoing = if (live == null) mockOutgoing else live.outgoing
     val right = when {
-        live == null -> mockTime
-        else -> live.timeText(now) ?: live.text.ifBlank { "Call" }
+        live == null -> if (mockOutgoing) firstTwoWords(MOCK_OUTGOING_NAME) else mockTime
+        else -> callPillText(live, 0, false, now)
     }
+    val glow = outgoing && look.outgoingGlow
+    val amount = look.outgoingGlowAmount.coerceIn(0f, 1f)
+    if (glow) OutgoingGlow(amount)
     PillSides(
         left = {
-            Icon(Icons.Rounded.Call, null, tint = IslandSpec.CallGreen, modifier = Modifier.size(pillIconDp(18f)))
+            Icon(
+                Icons.Rounded.Call, null, tint = IslandSpec.CallGreen,
+                modifier = Modifier.size(pillIconDp(18f)).then(if (glow) Modifier.outgoingRings(amount) else Modifier)
+            )
         },
         right = {
             Text(
@@ -1223,6 +1243,85 @@ private fun CompactCallContent(live: IslandLive?, mockTime: String) {
             )
         }
     )
+}
+
+/**
+ * Outgoing call (ringing on the other side): a calm green light that breathes along the pill's edge
+ * (ease-in-out, ~1.8 s) plus a soft band of light that sweeps across it (~2.4 s). Draw-only: no
+ * layout work per frame. Deliberately unlike the incoming pill (left-side flash + wiggling icon).
+ */
+@Composable
+private fun OutgoingGlow(amount: Float) {
+    val t = rememberInfiniteTransition(label = "outgoing")
+    val breath by t.animateFloat(
+        initialValue = 0f, targetValue = 1f,
+        animationSpec = infiniteRepeatable(tween(1800, easing = FastOutSlowInEasing), RepeatMode.Reverse),
+        label = "breath"
+    )
+    val sweep by t.animateFloat(
+        initialValue = -0.35f, targetValue = 1.35f,
+        animationSpec = infiniteRepeatable(tween(2400, easing = CubicBezierEasing(0.45f, 0f, 0.25f, 1f)), RepeatMode.Restart),
+        label = "sweep"
+    )
+    Canvas(Modifier.fillMaxSize()) {
+        val r = size.height / 2f
+        val sw = (1.4f + 0.8f * breath) * density
+        val a = amount * (0.28f + 0.42f * breath)
+        val green = IslandSpec.CallGreen
+        // Edge light, brightest at the ends, a little dimmer by the camera.
+        drawRoundRect(
+            brush = Brush.horizontalGradient(listOf(green.copy(alpha = a), green.copy(alpha = a * 0.35f), green.copy(alpha = a))),
+            topLeft = Offset(sw / 2f, sw / 2f),
+            size = Size(size.width - sw, size.height - sw),
+            cornerRadius = CornerRadius(r - sw / 2f),
+            style = Stroke(width = sw)
+        )
+        // Inner soft glow hugging the edge.
+        drawRoundRect(
+            brush = Brush.verticalGradient(
+                listOf(green.copy(alpha = a * 0.22f), Color.Transparent, green.copy(alpha = a * 0.22f))
+            ),
+            cornerRadius = CornerRadius(r)
+        )
+        // Light sweep.
+        val cx = size.width * sweep
+        val bw = size.width * 0.32f
+        drawRoundRect(
+            brush = Brush.horizontalGradient(
+                listOf(
+                    Color.Transparent,
+                    green.copy(alpha = amount * 0.14f),
+                    Color.White.copy(alpha = amount * 0.10f),
+                    green.copy(alpha = amount * 0.14f),
+                    Color.Transparent
+                ),
+                startX = cx - bw / 2f, endX = cx + bw / 2f
+            ),
+            cornerRadius = CornerRadius(r)
+        )
+    }
+}
+
+/** Two soft rings that keep leaving the phone icon while the other side rings (outgoing call). */
+@Composable
+private fun Modifier.outgoingRings(amount: Float): Modifier {
+    val t = rememberInfiniteTransition(label = "rings")
+    val p by t.animateFloat(
+        initialValue = 0f, targetValue = 1f,
+        animationSpec = infiniteRepeatable(tween(1800, easing = LinearEasing), RepeatMode.Restart),
+        label = "ringsP"
+    )
+    return this.drawBehind {
+        for (i in 0..1) {
+            val q = (p + i * 0.5f) % 1f
+            val e = 1f - (1f - q) * (1f - q) // ease-out
+            drawCircle(
+                color = IslandSpec.CallGreen.copy(alpha = amount * 0.5f * (1f - q)),
+                radius = size.minDimension / 2f * (0.9f + 0.75f * e),
+                style = Stroke(width = 1.2f * density)
+            )
+        }
+    }
 }
 
 /** Incoming call, first stage: long pill, green phone with a green glow + "Incoming call". */
@@ -1330,8 +1429,15 @@ private fun RoundButton(
 @Composable
 private fun ExpandedCallContent(live: IslandLive?, mockTime: String) {
     val now = rememberNow()
-    val name = live?.title?.ifBlank { null } ?: if (live == null) "Xiaomi" else "Call"
-    val time = if (live == null) mockTime else live.timeText(now) ?: live.text
+    val mockOutgoing by IslandController.mockOutgoing.collectAsState()
+    val name = live?.title?.ifBlank { null } ?: if (live == null) {
+        if (mockOutgoing) MOCK_OUTGOING_NAME else "Xiaomi"
+    } else "Call"
+    val time = when {
+        live == null -> if (mockOutgoing) "Calling…" else mockTime
+        live.outgoing -> "Calling…"
+        else -> live.timeText(now) ?: live.text
+    }
     val speakerUnsupported by IslandCallControl.speakerUnsupported.collectAsState()
     val showSpeaker = live == null || live.action(ActionRole.SPEAKER) != null ||
             (live.kind == LiveKind.CALL && live.sbnKey !in speakerUnsupported)
