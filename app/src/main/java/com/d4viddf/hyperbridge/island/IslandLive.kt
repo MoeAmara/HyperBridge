@@ -63,7 +63,9 @@ data class IslandLive(
     val contentIntent: PendingIntent?,
     val postTime: Long,
     /** Timer: full length in ms (from the notification, else the largest remaining time seen). */
-    val totalMs: Long? = null
+    val totalMs: Long? = null,
+    /** The phone's own full-screen call UI (incoming calls). */
+    val fullScreenIntent: PendingIntent? = null
 ) {
     fun action(vararg roles: ActionRole): LiveAction? =
         roles.firstNotNullOfOrNull { r -> actions.firstOrNull { it.role == r } }
@@ -401,7 +403,8 @@ object IslandNotifications {
             actions = actions,
             contentIntent = n.contentIntent,
             postTime = sbn.postTime,
-            totalMs = totalMs
+            totalMs = totalMs,
+            fullScreenIntent = n.fullScreenIntent
         )
     }
 

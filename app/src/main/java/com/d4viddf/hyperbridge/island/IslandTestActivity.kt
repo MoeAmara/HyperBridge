@@ -167,14 +167,31 @@ private fun IslandTestScreen(
             StateButton("Timer", Modifier.weight(1f)) { IslandController.show(IslandMode.TIMER_PILL) }
             StateButton("Recorder", Modifier.weight(1f)) { IslandController.show(IslandMode.REC_PILL) }
         }
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            StateButton("Two at once (Timer + Music)", Modifier.weight(1f)) {
+                IslandController.showTwo(IslandMode.TIMER_PILL, BubbleKind.MUSIC)
+            }
+            StateButton("Two at once (Call + Recorder)", Modifier.weight(1f)) {
+                IslandController.showTwo(IslandMode.COMPACT, BubbleKind.RECORDER)
+            }
+        }
         OutlinedButton(
             onClick = { IslandController.show(IslandMode.HIDDEN) },
             modifier = Modifier.fillMaxWidth()
         ) { Text("Hide") }
+        val blur by IslandController.blurState.collectAsState()
+        Text(
+            "Blur: ${blur.label}",
+            style = MaterialTheme.typography.bodySmall,
+            fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+            color = if (blur.real) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+        )
         Text(
             "Swipe left/right: a card shrinks to its pill, a pill hides into the camera. " +
                     "After a swipe-hide, swipe left/right on the camera to bring it back. " +
-                    "Tap a pill to expand it; touch anywhere else to collapse a card.",
+                    "Tap a pill to expand it; touch anywhere else to collapse a card. Incoming pill: tap opens the " +
+                    "phone's call screen. Two at once: tap the bubble to swap, long-press opens its app, " +
+                    "swipe on the bubble hides only the bubble.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
@@ -304,6 +321,13 @@ private fun CalibrationSection(
     CalRow("Wide width", wideDp, 100f, 380f, 0.5f, "dp") {
         onChange(c.copy(wideWidthDp = it), IslandMode.WIDE)
     }
+    CalRow("Pill inner padding", c.pillPadDp, 4f, 24f, 0.5f, "dp") {
+        onChange(c.copy(pillPadDp = it), if (currentMode.isCard() || currentMode == IslandMode.HIDDEN) IslandMode.REC_PILL else null)
+    }
+    val incomingDp = IslandLayout.incomingWidthPx(geometry, c, density) / density
+    CalRow("Incoming pill width", incomingDp, 100f, 380f, 0.5f, "dp") {
+        onChange(c.copy(incomingWidthDp = it), IslandMode.INCOMING_PILL)
+    }
     CalRow(
         label = if (c.radiusDp < 0f) "Corner radius (fully rounded)" else "Corner radius",
         value = radiusDp,
@@ -324,6 +348,41 @@ private fun CalibrationSection(
             modifier = Modifier.weight(1f)
         ) { Text("Reset to auto") }
     }
+
+    // ---- Two activities (bubble) ----
+    Spacer(Modifier.height(8.dp))
+    Text("Two at once (bubble)", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
+    Text(
+        "Changes preview with \"Two at once (Timer + Music)\" if no bubble is showing.",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant
+    )
+    val bubbleUp = IslandController.bubble.collectAsState().value != null
+    fun preview(next: IslandCalibration) {
+        onChange(next, null)
+        if (!bubbleUp) IslandController.showTwo(IslandMode.TIMER_PILL, BubbleKind.MUSIC)
+    }
+    val bubbleDp = IslandLayout.bubbleSizePx(geometry, c, density) / density
+    CalRow("Bubble size", bubbleDp, 16f, 64f, 0.5f, "dp") { preview(c.copy(bubbleSizeDp = it)) }
+    CalRow("Bubble gap", c.bubbleGapDp, 0f, 24f, 0.5f, "dp") { preview(c.copy(bubbleGapDp = it)) }
+    CalRow("Group horizontal offset", c.groupOffsetXPx, -120f, 120f, 1f, "px") { preview(c.copy(groupOffsetXPx = it)) }
+    CalRow("Counter shift (auto + manual)", c.counterShiftPx, -80f, 80f, 1f, "px") { preview(c.copy(counterShiftPx = it)) }
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Text("Counter right of camera", modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
+        Switch(checked = c.counterRight, onCheckedChange = { preview(c.copy(counterRight = it)) })
+    }
+    OutlinedButton(
+        onClick = {
+            val d = IslandCalibration()
+            preview(
+                c.copy(
+                    bubbleSizeDp = d.bubbleSizeDp, bubbleGapDp = d.bubbleGapDp, groupOffsetXPx = d.groupOffsetXPx,
+                    counterShiftPx = d.counterShiftPx, counterRight = d.counterRight
+                )
+            )
+        },
+        modifier = Modifier.fillMaxWidth()
+    ) { Text("Reset bubble") }
 }
 
 @Composable
@@ -508,19 +567,6 @@ private fun IconHideSection() {
     IconSwitchRow("Call", prefs.call, granted) { set(prefs.copy(call = it)) }
     IconSwitchRow("Timer & Stopwatch", prefs.timer, granted) { set(prefs.copy(timer = it)) }
     IconSwitchRow("Recorder", prefs.recorder, granted) { set(prefs.copy(recorder = it)) }
-    val minimal by IslandStatusMinimal.enabled.collectAsState()
-    val minimalStatus by IslandStatusMinimal.status.collectAsState()
-    LaunchedEffect(Unit) { IslandStatusMinimal.load(context) }
-    IconSwitchRow("Minimal status bar while island shows", minimal, granted) { IslandStatusMinimal.set(context, it) }
-    Text(
-        "Keeps only clock, battery and Wi-Fi (or mobile when Wi-Fi is off) while the island is visible; " +
-                "restores your exact status bar when it hides. HyperOS may ignore some icons; Xiaomi's own chips " +
-                "may stay.\nMinimal: $minimalStatus",
-        style = MaterialTheme.typography.bodySmall,
-        fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
-        color = if (minimalStatus.contains("fail") || minimalStatus.contains("PENDING") || minimalStatus.contains("error"))
-            MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant
-    )
     val scope = rememberCoroutineScope()
     var testing by remember { mutableStateOf(false) }
     OutlinedButton(
@@ -558,7 +604,6 @@ private fun CallControlSection() {
     var granted by remember { mutableStateOf(IslandCallControl.hasPermission(context)) }
     var shizuku by remember { mutableStateOf(IslandStatusBar.ShizukuState.NOT_RUNNING) }
     LaunchedEffect(Unit) {
-        IslandCallControl.loadHidePopup(context)
         while (true) {
             granted = IslandCallControl.hasPermission(context)
             shizuku = IslandStatusBar.state()
@@ -567,14 +612,12 @@ private fun CallControlSection() {
     }
     val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted = it }
     val actionStatus by IslandCallControl.actionStatus.collectAsState()
-    val hidePopup by IslandCallControl.hidePopup.collectAsState()
-    val popupStatus by IslandCallControl.popupStatus.collectAsState()
-    val shizukuOk = shizuku == IslandStatusBar.ShizukuState.GRANTED
 
     Text("Buttons & calls", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
     Text(
         "Card buttons fire the notification's own action. Calls without a usable action use call control " +
-                "(answer / end), then Shizuku key events. The app opens only if nothing works.",
+                "(answer / end), then Shizuku key events. If the notification has no matching action, " +
+                "the app opens quietly instead.",
         style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant
     )
@@ -593,39 +636,17 @@ private fun CallControlSection() {
         "Last button: $actionStatus",
         style = MaterialTheme.typography.bodySmall,
         fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
-        color = if (actionStatus.contains("FAILED") || actionStatus.contains("No action"))
+        color = if (actionStatus.contains("FAILED"))
             MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant
     )
-
-    Spacer(Modifier.height(8.dp))
-    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-        Text(
-            "Hide system incoming-call popup (Shizuku)",
-            modifier = Modifier.weight(1f),
-            style = MaterialTheme.typography.bodyMedium
-        )
-        Switch(
-            checked = hidePopup,
-            enabled = shizukuOk || hidePopup,
-            onCheckedChange = { IslandCallControl.setHidePopup(context, it) }
-        )
-    }
     Text(
-        "Off by default. While a call rings, heads-up notifications are turned off for the whole phone " +
-                "(other pop-ups won't show either during the ring) and restored to the previous value as soon " +
-                "as the ring ends. If the original popup still shows, HyperOS draws it as a separate window, " +
-                "not a heads-up, and this can't hide it.",
-        style = MaterialTheme.typography.bodySmall,
-        color = if (shizukuOk) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.error
-    )
-    Text(
-        "Shizuku: ${shizuku.label}\nPopup: $popupStatus",
+        "Shizuku: ${shizuku.label}",
         style = MaterialTheme.typography.bodySmall,
         fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
-        color = if (popupStatus.contains("fail") || popupStatus.contains("PENDING") || popupStatus.contains("error"))
-            MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant
+        color = MaterialTheme.colorScheme.onSurfaceVariant
     )
 }
+
 
 @Composable
 private fun IconSwitchRow(label: String, checked: Boolean, granted: Boolean, onChange: (Boolean) -> Unit) {

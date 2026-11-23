@@ -46,12 +46,8 @@ object IslandCallControl {
     private val _speakerOn = MutableStateFlow(false)
     val speakerOn: StateFlow<Boolean> = _speakerOn.asStateFlow()
 
-    /** Opt-in (default OFF): hide the system incoming-call heads-up via Shizuku while ringing. */
-    private val _hidePopup = MutableStateFlow(false)
-    val hidePopup: StateFlow<Boolean> = _hidePopup.asStateFlow()
-
+    /** Result of restoring a heads-up value left changed by Phase 3.2 (logged only). */
     private val _popupStatus = MutableStateFlow("idle")
-    val popupStatus: StateFlow<String> = _popupStatus.asStateFlow()
 
     fun status(text: String) {
         Log.i(TAG, text)
@@ -183,40 +179,7 @@ object IslandCallControl {
         status("speaker: not possible ($why) — button hidden for this call")
     }
 
-    // ---- Hide system incoming-call popup (Shizuku, opt-in) ---------------------------------
-
-    fun loadHidePopup(context: Context) {
-        _hidePopup.value = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean("hideCallPopup", false)
-    }
-
-    fun setHidePopup(context: Context, value: Boolean) {
-        _hidePopup.value = value
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean("hideCallPopup", value).apply()
-    }
-
-    /** Turns heads-up off (remembering the previous value) — only while an incoming call rings. */
-    suspend fun suppressHeadsUp(context: Context) = withContext(NonCancellable) {
-        if (IslandStatusBar.state() != IslandStatusBar.ShizukuState.GRANTED) {
-            _popupStatus.value = "skipped: ${IslandStatusBar.state().label}"
-            return@withContext
-        }
-        val p = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        if (!p.getBoolean("huChanged", false)) {
-            val got = IslandStatusBar.run("settings get global $HU_KEY")
-            val prev = got.lineSequence().drop(1).firstOrNull()?.trim().orEmpty()
-            if (!got.startsWith("exit=0")) {
-                _popupStatus.value = "read failed → ${got.firstLine()} (nothing changed)"
-                return@withContext
-            }
-            // Remember BEFORE changing, so a crash can never leave heads-up off.
-            p.edit().putBoolean("huChanged", true).putString("huPrev", prev).commit()
-        }
-        val put = IslandStatusBar.run("settings put global $HU_KEY 0")
-        _popupStatus.value = "ringing → heads-up off → ${put.firstLine()} (previous=${p.getString("huPrev", "?")})"
-        if (!put.startsWith("exit=0")) {
-            p.edit().putBoolean("huChanged", false).commit()
-        }
-    }
+    // ---- Leftover heads-up restore (Phase 3.2 switch removed in Phase 4) ----------------------
 
     /** Restores heads-up to what it was, if we changed it. Safe to call any time. */
     suspend fun restoreHeadsUp(context: Context, why: String) = withContext(NonCancellable) {

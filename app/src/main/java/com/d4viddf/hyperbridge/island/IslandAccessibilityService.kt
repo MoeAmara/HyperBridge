@@ -79,10 +79,10 @@ class IslandAccessibilityService : AccessibilityService(), LifecycleOwner, ViewM
     private var mediaWatcher: IslandMediaWatcher? = null
     private var lockReceiver: BroadcastReceiver? = null
     private var iconJob: Job? = null
-    private var headsUpJob: Job? = null
-    private var minimalJob: Job? = null
-    private val wifiConnected = MutableStateFlow(false)
-    private var netCallback: android.net.ConnectivityManager.NetworkCallback? = null
+    private var cleanupJob: Job? = null
+    private var blurJob: Job? = null
+    private var blurDialog: android.app.Dialog? = null
+    private var blurListener: java.util.function.Consumer<Boolean>? = null
 
     /** Bumped on screen-on: re-check the status-bar flags (SystemUI may have reset them). */
     private val iconRecheck = MutableStateFlow(0)
@@ -141,6 +141,8 @@ class IslandAccessibilityService : AccessibilityService(), LifecycleOwner, ViewM
         IslandController.setIconHide(IslandCalibrationStore.loadIconHide(this))
         IslandMedia.appContext = applicationContext
         IslandController.setServiceRunning(true)
+        // Order matters: the blur window must sit BELOW the island's draw window, so add it first.
+        addBlurWindow()
         addOverlay()
         addTouchWindow()
         registerLockReceiver()
@@ -152,13 +154,13 @@ class IslandAccessibilityService : AccessibilityService(), LifecycleOwner, ViewM
                 IslandController.geometry,
                 IslandController.calibration,
                 IslandController.restorable,
-                IslandController.compactNeedPx
-            ) { m, g, c, r, need -> TouchState(m, g, c, r, need) }
+                combine(IslandController.layoutMain, IslandController.layoutBubble) { a, b -> a to b }
+            ) { m, g, c, r, lay -> TouchState(m, g, c, r, lay.first, lay.second) }
                 .collect { updateTouchWindow(it) }
         }
         startIconHide()
-        startHeadsUpGuard()
-        startMinimalStatus()
+        startLeftoverRestore()
+        startBlur()
         // Real music: watch media sessions; retry until notification access is granted.
         val watcher = mediaWatcher ?: IslandMediaWatcher(this).also { mediaWatcher = it }
         mediaJob?.cancel()
@@ -184,12 +186,11 @@ class IslandAccessibilityService : AccessibilityService(), LifecycleOwner, ViewM
                 IslandController.mode,
                 IslandController.shownLive,
                 IslandController.iconHide,
-                iconRecheck,
-                IslandStatusMinimal.enabled
-            ) { m, l, prefs, tick, minimal ->
+                iconRecheck
+            ) { m, l, prefs, tick ->
                 // Only the KIND matters: the live object changes every second (timer / recorder
                 // ticks), which used to cancel the debounce below before the command could run.
-                Pair(m != IslandMode.HIDDEN && (minimal || prefs.wants(l?.kind ?: m.mockLiveKind())), tick)
+                Pair(m != IslandMode.HIDDEN && prefs.wants(l?.kind ?: m.mockLiveKind()), tick)
             }
                 .distinctUntilChanged()
                 .collectLatest { (want, tick) ->
@@ -218,84 +219,133 @@ class IslandAccessibilityService : AccessibilityService(), LifecycleOwner, ViewM
     }
 
     /**
-     * Opt-in: while an incoming call rings, turn heads-up off via Shizuku so the system call popup
-     * doesn't sit on top of the island; restore the exact previous value as soon as ringing ends.
-     * Also restores a leftover change on start (e.g. after a crash) so it can never stay off.
+     * Phase 4 removed the "hide incoming popup" (heads-up) and "minimal status bar" switches.
+     * If an older build left either setting changed, put it back once (retrying while Shizuku is
+     * unavailable), then the saved flag is cleared by the restore itself.
      */
-    private fun startHeadsUpGuard() {
-        IslandCallControl.loadHidePopup(this)
-        headsUpJob?.cancel()
-        headsUpJob = lifecycleScope.launch {
-            IslandCallControl.restoreHeadsUp(this@IslandAccessibilityService, "service start")
-            // Safety net: if a restore couldn't run (Shizuku was down), retry until it does.
-            launch {
-                while (isActive) {
-                    delay(20_000L)
-                    if (!IslandNotifications.ringing.value &&
-                        IslandCallControl.headsUpChangedByUs(this@IslandAccessibilityService)
-                    ) IslandCallControl.restoreHeadsUp(this@IslandAccessibilityService, "retry")
-                }
+    private fun startLeftoverRestore() {
+        cleanupJob?.cancel()
+        val ctx = this@IslandAccessibilityService
+        if (!IslandCallControl.headsUpChangedByUs(ctx) && !IslandStatusMinimal.changedByUs(ctx)) return
+        cleanupJob = lifecycleScope.launch {
+            while (isActive) {
+                if (IslandCallControl.headsUpChangedByUs(ctx)) IslandCallControl.restoreHeadsUp(ctx, "leftover from 3.2")
+                if (IslandStatusMinimal.changedByUs(ctx)) IslandStatusMinimal.restore(ctx, "leftover from 3.2")
+                if (!IslandCallControl.headsUpChangedByUs(ctx) && !IslandStatusMinimal.changedByUs(ctx)) break
+                delay(20_000L)
             }
-            combine(IslandNotifications.ringing, IslandCallControl.hidePopup) { ringing, on -> ringing && on }
-                .distinctUntilChanged()
-                .collectLatest { want ->
-                    if (want) IslandCallControl.suppressHeadsUp(this@IslandAccessibilityService)
-                    else IslandCallControl.restoreHeadsUp(this@IslandAccessibilityService, "ringing ended / switch off")
-                }
         }
     }
+
+    // ---- Real blur behind expanded cards ----------------------------------------------------
 
     /**
-     * Opt-in: while the island is visible, keep only clock, battery and one connectivity icon
-     * (Wi-Fi if connected, else mobile) via `settings secure icon_blacklist`; restore exactly when hidden.
+     * A transparent overlay window (via a Dialog, so it has a real Window) placed BELOW the island's
+     * draw window. When a card has settled, it is moved exactly behind the card and gets
+     * Window.setBackgroundBlurRadius with a rounded background, so what's behind the card is
+     * blurred; the card itself then draws a dark tint over it. Hidden (1x1, no blur) otherwise.
      */
-    private fun startMinimalStatus() {
-        IslandStatusMinimal.load(this)
-        registerWifiWatch()
-        minimalJob?.cancel()
-        minimalJob = lifecycleScope.launch {
-            IslandStatusMinimal.restore(this@IslandAccessibilityService, "service start")
-            launch {
-                while (isActive) {
-                    delay(20_000L)
-                    if (IslandController.mode.value == IslandMode.HIDDEN &&
-                        IslandStatusMinimal.changedByUs(this@IslandAccessibilityService)
-                    ) IslandStatusMinimal.restore(this@IslandAccessibilityService, "retry")
-                }
+    private fun addBlurWindow() {
+        if (blurDialog != null) return
+        try {
+            val dlg = android.app.Dialog(this, android.R.style.Theme_Translucent_NoTitleBar)
+            val w = dlg.window ?: return
+            w.setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
+            w.addFlags(
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                        WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                        WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                        WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                        WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+            )
+            w.clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
+            w.setDimAmount(0f)
+            w.setBackgroundDrawable(blurShape(0f))
+            w.setWindowAnimations(0)
+            w.attributes = w.attributes.apply {
+                gravity = Gravity.TOP or Gravity.START
+                x = 0
+                y = 0
+                width = 1
+                height = 1
+                layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+                fitInsetsTypes = 0
+                title = "HyperBridgeIslandBlur"
             }
-            combine(IslandController.mode, IslandStatusMinimal.enabled, wifiConnected) { m, on, wifi ->
-                if (on && m != IslandMode.HIDDEN) wifi else null // null = restore
-            }
-                .distinctUntilChanged()
-                .collectLatest { wifi ->
-                    if (wifi != null) {
-                        delay(150L)
-                        IslandStatusMinimal.apply(this@IslandAccessibilityService, wifi)
-                    } else {
-                        delay(600L)
-                        IslandStatusMinimal.restore(this@IslandAccessibilityService, "island hidden / switch off")
-                    }
-                }
+            dlg.setCancelable(false)
+            dlg.setContentView(View(this))
+            dlg.show()
+            blurDialog = dlg
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to add blur window", e)
+            blurDialog = null
         }
     }
 
-    private fun registerWifiWatch() {
-        if (netCallback != null) return
-        val cm = getSystemService(android.net.ConnectivityManager::class.java) ?: return
-        val cb = object : android.net.ConnectivityManager.NetworkCallback() {
-            override fun onCapabilitiesChanged(network: android.net.Network, caps: android.net.NetworkCapabilities) {
-                wifiConnected.value = caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI)
-            }
-            override fun onLost(network: android.net.Network) {
-                wifiConnected.value = false
+    private fun blurShape(radius: Float) = android.graphics.drawable.GradientDrawable().apply {
+        // Nearly transparent: only there to give the blur region its rounded corners.
+        setColor(0x01000000)
+        cornerRadius = radius
+    }
+
+    private fun startBlur() {
+        val wm = windowManager ?: return
+        fun publish(enabled: Boolean) {
+            IslandController.setBlurState(
+                when {
+                    blurDialog == null -> BlurState(false, "fallback — blur window could not be created")
+                    !enabled -> BlurState(false, "fallback — system cross-window blur is OFF on this phone")
+                    else -> BlurState(true, "real — cross-window blur available")
+                }
+            )
+        }
+        publish(wm.isCrossWindowBlurEnabled)
+        if (blurListener == null) {
+            val l = java.util.function.Consumer<Boolean> { publish(it) }
+            try {
+                wm.addCrossWindowBlurEnabledListener(mainExecutor, l)
+                blurListener = l
+            } catch (e: Exception) {
+                Log.e(TAG, "blur listener failed", e)
             }
         }
+        blurJob?.cancel()
+        blurJob = lifecycleScope.launch {
+            IslandController.blurRect.collect { placeBlur(it) }
+        }
+    }
+
+    private fun placeBlur(rect: IslandRectPx?) {
+        val w = blurDialog?.window ?: return
         try {
-            cm.registerDefaultNetworkCallback(cb)
-            netCallback = cb
+            val a = w.attributes
+            if (rect == null) {
+                w.setBackgroundBlurRadius(0)
+                a.x = 0
+                a.y = 0
+                a.width = 1
+                a.height = 1
+            } else {
+                w.setBackgroundDrawable(blurShape(rect.r))
+                w.setBackgroundBlurRadius((28f * resources.displayMetrics.density).roundToInt())
+                a.x = rect.left.roundToInt()
+                a.y = rect.top.roundToInt()
+                a.width = rect.w.roundToInt().coerceAtLeast(1)
+                a.height = rect.h.roundToInt().coerceAtLeast(1)
+            }
+            w.attributes = a
         } catch (e: Exception) {
-            Log.e(TAG, "network callback failed", e)
+            Log.e(TAG, "Failed to place blur window", e)
         }
+    }
+
+    private fun removeBlurWindow() {
+        blurJob?.cancel()
+        blurJob = null
+        blurListener?.let { l -> try { windowManager?.removeCrossWindowBlurEnabledListener(l) } catch (_: Exception) {} }
+        blurListener = null
+        try { blurDialog?.dismiss() } catch (_: Exception) {}
+        blurDialog = null
     }
 
     private data class TouchState(
@@ -303,8 +353,9 @@ class IslandAccessibilityService : AccessibilityService(), LifecycleOwner, ViewM
         val geometry: IslandGeometry?,
         val calibration: IslandCalibration,
         val restorable: IslandMode?,
-        /** Counter pill width need; only here so the touch window follows a widening pill. */
-        val compactNeedPx: Float = 0f
+        /** Target shapes published by the overlay (main pill / card, bubble). */
+        val main: IslandRectPx? = null,
+        val bubble: IslandRectPx? = null
     )
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -340,14 +391,9 @@ class IslandAccessibilityService : AccessibilityService(), LifecycleOwner, ViewM
     override fun onDestroy() {
         iconJob?.cancel()
         iconJob = null
-        headsUpJob?.cancel()
-        headsUpJob = null
-        minimalJob?.cancel()
-        minimalJob = null
-        netCallback?.let { cb ->
-            try { getSystemService(android.net.ConnectivityManager::class.java)?.unregisterNetworkCallback(cb) } catch (_: Exception) {}
-        }
-        netCallback = null
+        cleanupJob?.cancel()
+        cleanupJob = null
+        removeBlurWindow()
         if (IslandStatusMinimal.changedByUs(this)) {
             val c = applicationContext
             CoroutineScope(SupervisorJob() + Dispatchers.IO).launch { IslandStatusMinimal.restore(c, "service stopped") }
@@ -471,8 +517,18 @@ class IslandAccessibilityService : AccessibilityService(), LifecycleOwner, ViewM
         val density = resources.displayMetrics.density
         val rect: IslandRectPx? = when {
             geometry == null -> null
-            state.mode != IslandMode.HIDDEN ->
-                IslandLayout.target(state.mode, geometry, state.calibration, density)
+            state.mode != IslandMode.HIDDEN -> {
+                // Cover the pill AND the bubble (union), from the overlay's published layout.
+                val main = state.main ?: IslandLayout.target(state.mode, geometry, state.calibration, density)
+                val b = state.bubble
+                if (b == null) main else {
+                    val left = minOf(main.left, b.left)
+                    val right = maxOf(main.left + main.w, b.left + b.w)
+                    val top = minOf(main.top, b.top)
+                    val bottom = maxOf(main.top + main.h, b.top + b.h)
+                    IslandRectPx((left + right) / 2f, top, right - left, bottom - top, 0f)
+                }
+            }
             state.restorable != null ->
                 IslandLayout.restoreZone(geometry, state.calibration, density)
             else -> null
@@ -515,7 +571,7 @@ class IslandAccessibilityService : AccessibilityService(), LifecycleOwner, ViewM
         private var fired = false
         private var tracker: VelocityTracker? = null
         private val longPress = Runnable {
-            if (!fired && IslandController.onLongPress()) {
+            if (!fired && IslandController.onLongPress(downX, downY)) {
                 // Consumed: the release must not also count as a tap / swipe.
                 fired = true
                 performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS)
@@ -549,10 +605,10 @@ class IslandAccessibilityService : AccessibilityService(), LifecycleOwner, ViewM
                         }
                         if (abs(dx) > swipeSlop && abs(dx) > abs(dy) * 1.2f) {
                             fired = true
-                            IslandController.onSwipe()
+                            IslandController.onSwipe(downX, downY)
                         } else if (dy > swipeSlop && dy > abs(dx) * 1.2f) {
                             fired = true
-                            IslandController.onPullDown()
+                            IslandController.onPullDown(downX, downY)
                         }
                     }
                 }
@@ -572,7 +628,7 @@ class IslandAccessibilityService : AccessibilityService(), LifecycleOwner, ViewM
                         val dx = event.rawX - downX
                         val dy = event.rawY - downY
                         if (abs(vx) > flingVelocity && abs(dx) > flingMinDistance && abs(dx) > abs(dy)) {
-                            IslandController.onSwipe()
+                            IslandController.onSwipe(downX, downY)
                         } else if (abs(dx) <= tapSlop && abs(dy) <= tapSlop) {
                             IslandController.onTap(event.rawX, event.rawY)
                         }
