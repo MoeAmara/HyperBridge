@@ -60,7 +60,10 @@ class IslandTestActivity : ComponentActivity() {
                         onCalibrationChange = { c, preview -> applyCalibration(c, preview) },
                         onOpenAccessibility = { openAccessibilitySettings() },
                         onOpenAppInfo = { openAppInfo() },
-                        onOpenAutostart = { openAutostart() }
+                        onOpenAutostart = { openAutostart() },
+                        onOpenNotificationAccess = {
+                            startSafely(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+                        }
                     )
                 }
             }
@@ -108,7 +111,8 @@ private fun IslandTestScreen(
     onCalibrationChange: (IslandCalibration, IslandMode?) -> Unit,
     onOpenAccessibility: () -> Unit,
     onOpenAppInfo: () -> Unit,
-    onOpenAutostart: () -> Unit
+    onOpenAutostart: () -> Unit,
+    onOpenNotificationAccess: () -> Unit
 ) {
     val running by IslandController.serviceRunning.collectAsState()
     val mode by IslandController.mode.collectAsState()
@@ -149,15 +153,23 @@ private fun IslandTestScreen(
             StateButton("Expanded", Modifier.weight(1f)) { IslandController.show(IslandMode.EXPANDED) }
             StateButton("Music", Modifier.weight(1f)) { IslandController.show(IslandMode.MUSIC) }
         }
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            StateButton("Music pill", Modifier.weight(1f)) { IslandController.show(IslandMode.COMPACT_MUSIC) }
+        }
         OutlinedButton(
             onClick = { IslandController.show(IslandMode.HIDDEN) },
             modifier = Modifier.fillMaxWidth()
         ) { Text("Hide") }
         Text(
-            "Tip: swipe the island left or right to dismiss it.",
+            "Swipe left/right: a card shrinks to its pill, a pill hides into the camera. " +
+                    "After a swipe-hide, swipe left/right on the camera to bring it back. " +
+                    "Tap a pill to expand it; touch anywhere else to collapse a card.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
+
+        Spacer(Modifier.height(12.dp))
+        MusicSection(onOpenNotificationAccess)
 
         Spacer(Modifier.height(12.dp))
         CalibrationSection(
@@ -185,6 +197,37 @@ private fun IslandTestScreen(
 }
 
 @Composable
+private fun MusicSection(onOpenNotificationAccess: () -> Unit) {
+    val access by IslandController.mediaAccess.collectAsState()
+    val media by IslandController.media.collectAsState()
+    Text("Music (real)", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+    Text(
+        text = if (access) "Notification access: granted" else "Notification access: NOT granted",
+        color = if (access) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
+        style = MaterialTheme.typography.bodyMedium
+    )
+    if (!access) {
+        Text(
+            "Needed to read what is playing. Enable HyperBridge (os2test) in the list; " +
+                    "the island picks it up within a few seconds.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        OutlinedButton(onClick = onOpenNotificationAccess, modifier = Modifier.fillMaxWidth()) {
+            Text("Grant notification access")
+        }
+    }
+    val m = media
+    Text(
+        text = if (m == null) "Now playing: nothing"
+        else "Now playing: ${m.title}${if (m.artist.isNotEmpty()) " — " + m.artist else ""} " +
+                "(${m.packageName}, ${if (m.playing) "playing" else "paused"})",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant
+    )
+}
+
+@Composable
 private fun CalibrationSection(
     geometry: IslandGeometry?,
     calibration: IslandCalibration,
@@ -209,7 +252,11 @@ private fun CalibrationSection(
     )
 
     // Keep showing whichever pill is up; otherwise preview the compact pill.
-    val pillPreview = if (currentMode == IslandMode.WIDE) IslandMode.WIDE else IslandMode.COMPACT
+    val pillPreview = when (currentMode) {
+        IslandMode.WIDE -> IslandMode.WIDE
+        IslandMode.COMPACT_MUSIC -> IslandMode.COMPACT_MUSIC
+        else -> IslandMode.COMPACT
+    }
     val c = calibration
     val pillHDp = IslandLayout.pillHeightPx(geometry, c, density) / density
     val compactDp = IslandLayout.compactWidthPx(geometry, c, density) / density

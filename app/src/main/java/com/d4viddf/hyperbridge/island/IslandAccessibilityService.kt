@@ -8,6 +8,7 @@ import android.view.Gravity
 import android.view.MotionEvent
 import android.view.VelocityTracker
 import android.view.View
+import android.view.ViewConfiguration
 import android.view.WindowInsets
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
@@ -31,8 +32,11 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlin.math.abs
 import kotlin.math.roundToInt
 
 /**
@@ -42,9 +46,10 @@ import kotlin.math.roundToInt
  * Two windows:
  *  - a large, fixed, NON-touchable draw window (the morphing island is drawn here;
  *    it is never relaid out per frame, so animation stays smooth);
- *  - a small transparent touch window sized to the island's target bounds, used only
- *    for swipe-to-dismiss. It is resized only when the mode / calibration changes and
- *    is non-touchable while the island is hidden, so nothing outside the pill eats touches.
+ *  - a small transparent touch window sized to the island's target bounds (swipe, tap,
+ *    pull-down, outside-touch to collapse). It is resized only when the mode / calibration
+ *    changes. While hidden it shrinks to a restore zone around the camera only if there is
+ *    something to bring back; otherwise it is non-touchable, so nothing else eats touches.
  */
 class IslandAccessibilityService : AccessibilityService(), LifecycleOwner, ViewModelStoreOwner,
     SavedStateRegistryOwner {
@@ -62,6 +67,8 @@ class IslandAccessibilityService : AccessibilityService(), LifecycleOwner, ViewM
     private var touchView: View? = null
     private var touchParams: WindowManager.LayoutParams? = null
     private var touchJob: Job? = null
+    private var mediaJob: Job? = null
+    private var mediaWatcher: IslandMediaWatcher? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -83,11 +90,27 @@ class IslandAccessibilityService : AccessibilityService(), LifecycleOwner, ViewM
             combine(
                 IslandController.mode,
                 IslandController.geometry,
-                IslandController.calibration
-            ) { m, g, c -> Triple(m, g, c) }
-                .collect { (m, g, c) -> updateTouchWindow(m, g, c) }
+                IslandController.calibration,
+                IslandController.restorable
+            ) { m, g, c, r -> TouchState(m, g, c, r) }
+                .collect { updateTouchWindow(it) }
+        }
+        // Real music: watch media sessions; retry until notification access is granted.
+        val watcher = mediaWatcher ?: IslandMediaWatcher(this).also { mediaWatcher = it }
+        mediaJob?.cancel()
+        mediaJob = lifecycleScope.launch {
+            while (isActive && !watcher.tryStart()) {
+                delay(3000)
+            }
         }
     }
+
+    private data class TouchState(
+        val mode: IslandMode,
+        val geometry: IslandGeometry?,
+        val calibration: IslandCalibration,
+        val restorable: IslandMode?
+    )
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         // The test build does not react to accessibility events.
@@ -116,6 +139,10 @@ class IslandAccessibilityService : AccessibilityService(), LifecycleOwner, ViewM
         }
         touchJob?.cancel()
         touchJob = null
+        mediaJob?.cancel()
+        mediaJob = null
+        mediaWatcher?.stop()
+        mediaWatcher = null
         removeTouchWindow()
         removeOverlay()
         IslandController.setServiceRunning(false)
@@ -139,7 +166,8 @@ class IslandAccessibilityService : AccessibilityService(), LifecycleOwner, ViewM
                 val mode by IslandController.mode.collectAsState()
                 val geo by IslandController.geometry.collectAsState()
                 val cal by IslandController.calibration.collectAsState()
-                geo?.let { IslandOverlay(geometry = it, mode = mode, calibration = cal) }
+                val media by IslandController.media.collectAsState()
+                geo?.let { IslandOverlay(geometry = it, mode = mode, calibration = cal, media = media) }
             }
         }
 
@@ -170,6 +198,7 @@ class IslandAccessibilityService : AccessibilityService(), LifecycleOwner, ViewM
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                     WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
                     WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                    WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH or
                     WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
                     WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT
@@ -204,23 +233,32 @@ class IslandAccessibilityService : AccessibilityService(), LifecycleOwner, ViewM
     }
 
     /** Resizes the touch window to the island's TARGET bounds (not per animation frame). */
-    private fun updateTouchWindow(mode: IslandMode, geometry: IslandGeometry?, calibration: IslandCalibration) {
+    private fun updateTouchWindow(state: TouchState) {
         val view = touchView ?: return
         val params = touchParams ?: return
         val notTouchable = WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-        if (mode == IslandMode.HIDDEN || geometry == null) {
+        val geometry = state.geometry
+        val density = resources.displayMetrics.density
+        val rect: IslandRectPx? = when {
+            geometry == null -> null
+            state.mode != IslandMode.HIDDEN ->
+                IslandLayout.target(state.mode, geometry, state.calibration, density)
+            state.restorable != null ->
+                IslandLayout.restoreZone(geometry, state.calibration, density)
+            else -> null
+        }
+        if (rect == null) {
             params.flags = params.flags or notTouchable
             params.x = 0
             params.y = 0
             params.width = 1
             params.height = 1
         } else {
-            val t = IslandLayout.target(mode, geometry, calibration, resources.displayMetrics.density)
             params.flags = params.flags and notTouchable.inv()
-            params.x = t.left.roundToInt()
-            params.y = t.top.roundToInt()
-            params.width = t.w.roundToInt().coerceAtLeast(1)
-            params.height = t.h.roundToInt().coerceAtLeast(1)
+            params.x = rect.left.roundToInt()
+            params.y = rect.top.roundToInt()
+            params.width = rect.w.roundToInt().coerceAtLeast(1)
+            params.height = rect.h.roundToInt().coerceAtLeast(1)
         }
         try {
             windowManager?.updateViewLayout(view, params)
@@ -229,33 +267,75 @@ class IslandAccessibilityService : AccessibilityService(), LifecycleOwner, ViewM
         }
     }
 
-    /** Transparent view that turns horizontal drags on the pill into swipe events. */
+    /**
+     * Transparent view on top of the island:
+     *  - horizontal swipe (no finger-follow) -> IslandController.onSwipe(), fired once per gesture;
+     *  - pull down -> expand; tap -> expand / card buttons;
+     *  - any touch outside the island -> collapse an expanded card.
+     */
     private inner class IslandTouchView : View(this@IslandAccessibilityService) {
+        private val density = resources.displayMetrics.density
+        private val swipeSlop = 24f * density
+        private val flingMinDistance = 8f * density
+        private val flingVelocity = 600f * density
+        private val tapSlop = ViewConfiguration.get(this@IslandAccessibilityService).scaledTouchSlop.toFloat()
         private var downX = 0f
+        private var downY = 0f
+        private var fired = false
         private var tracker: VelocityTracker? = null
 
         override fun onTouchEvent(event: MotionEvent): Boolean {
             when (event.actionMasked) {
+                MotionEvent.ACTION_OUTSIDE -> {
+                    IslandController.onOutsideTouch()
+                    return false
+                }
                 MotionEvent.ACTION_DOWN -> {
                     tracker?.recycle()
                     tracker = VelocityTracker.obtain().also { it.addMovement(event) }
                     downX = event.rawX
+                    downY = event.rawY
+                    fired = false
                 }
                 MotionEvent.ACTION_MOVE -> {
                     tracker?.addMovement(event)
-                    IslandController.emitDrag(IslandDrag.Move(event.rawX - downX))
+                    if (!fired) {
+                        val dx = event.rawX - downX
+                        val dy = event.rawY - downY
+                        if (abs(dx) > swipeSlop && abs(dx) > abs(dy) * 1.2f) {
+                            fired = true
+                            IslandController.onSwipe()
+                        } else if (dy > swipeSlop && dy > abs(dx) * 1.2f) {
+                            fired = true
+                            IslandController.onPullDown()
+                        }
+                    }
                 }
-                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                MotionEvent.ACTION_UP -> {
                     val t = tracker
-                    var velocity = 0f
-                    if (t != null && event.actionMasked == MotionEvent.ACTION_UP) {
+                    var vx = 0f
+                    if (t != null) {
                         t.addMovement(event)
                         t.computeCurrentVelocity(1000)
-                        velocity = t.xVelocity
+                        vx = t.xVelocity
                     }
                     t?.recycle()
                     tracker = null
-                    IslandController.emitDrag(IslandDrag.End(event.rawX - downX, velocity))
+                    if (!fired) {
+                        val dx = event.rawX - downX
+                        val dy = event.rawY - downY
+                        if (abs(vx) > flingVelocity && abs(dx) > flingMinDistance && abs(dx) > abs(dy)) {
+                            IslandController.onSwipe()
+                        } else if (abs(dx) <= tapSlop && abs(dy) <= tapSlop) {
+                            IslandController.onTap(event.rawX, event.rawY)
+                        }
+                    }
+                    fired = false
+                }
+                MotionEvent.ACTION_CANCEL -> {
+                    tracker?.recycle()
+                    tracker = null
+                    fired = false
                 }
             }
             return true

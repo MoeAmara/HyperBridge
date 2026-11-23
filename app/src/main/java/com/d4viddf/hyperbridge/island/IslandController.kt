@@ -1,11 +1,11 @@
 package com.d4viddf.hyperbridge.island
 
 import android.content.Context
-import kotlinx.coroutines.flow.MutableSharedFlow
+import android.os.Handler
+import android.os.Looper
+import androidx.compose.ui.geometry.Rect
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlin.math.max
 import kotlin.math.min
@@ -27,8 +27,17 @@ enum class IslandMode {
     EXPANDED,
 
     /** Expanded music card below the camera: art, title, artist, controls, progress. */
-    MUSIC
+    MUSIC,
+
+    /** Compact music pill: album art left of the camera, sound-wave bars right of it. */
+    COMPACT_MUSIC
 }
+
+/** True for the big cards that sit below the camera row. */
+fun IslandMode.isCard(): Boolean = this == IslandMode.EXPANDED || this == IslandMode.MUSIC
+
+/** True for the music states (real or mock music). */
+fun IslandMode.isMusic(): Boolean = this == IslandMode.MUSIC || this == IslandMode.COMPACT_MUSIC
 
 /** Camera / screen geometry, in physical pixels of the display. */
 data class IslandGeometry(
@@ -59,11 +68,8 @@ data class IslandRectPx(val cx: Float, val top: Float, val w: Float, val h: Floa
     val left: Float get() = cx - w / 2f
 }
 
-/** Swipe gestures coming from the small touch window, in px. */
-sealed interface IslandDrag {
-    data class Move(val totalDx: Float) : IslandDrag
-    data class End(val totalDx: Float, val velocityX: Float) : IslandDrag
-}
+/** Tappable controls on the music card; their on-screen bounds are reported by the overlay. */
+enum class IslandButton { PREV, PLAY_PAUSE, NEXT }
 
 /**
  * Measured from the HyperOS 3 reference videos (see hyperisland-ref/SPEC.md).
@@ -112,6 +118,16 @@ object IslandLayout {
         )
     }
 
+    /**
+     * Invisible touch zone around the camera used to bring a swiped-away island back:
+     * about the compact pill's width, and as tall as the status bar (or the pill, if taller).
+     */
+    fun restoreZone(g: IslandGeometry, c: IslandCalibration, density: Float): IslandRectPx {
+        val p = pill(g, c, density, compactWidthPx(g, c, density))
+        val bottom = max(g.statusBarHeightPx.toFloat(), p.top + p.h)
+        return IslandRectPx(p.cx, 0f, p.w, bottom, 0f)
+    }
+
     /** The camera-sized black dot the island grows out of and shrinks back into. */
     fun camera(g: IslandGeometry, c: IslandCalibration, density: Float): IslandRectPx {
         val d = min(g.cameraDiameterPx, pillHeightPx(g, c, density))
@@ -132,7 +148,7 @@ object IslandLayout {
     fun target(mode: IslandMode, g: IslandGeometry, c: IslandCalibration, density: Float): IslandRectPx =
         when (mode) {
             IslandMode.HIDDEN -> camera(g, c, density)
-            IslandMode.COMPACT -> pill(g, c, density, compactWidthPx(g, c, density))
+            IslandMode.COMPACT, IslandMode.COMPACT_MUSIC -> pill(g, c, density, compactWidthPx(g, c, density))
             IslandMode.WIDE -> pill(g, c, density, wideWidthPx(g, c, density))
             IslandMode.EXPANDED -> card(g, c, density, CALL_HEIGHT_RATIO)
             IslandMode.MUSIC -> card(g, c, density, MUSIC_HEIGHT_RATIO)
@@ -167,8 +183,12 @@ object IslandCalibrationStore {
     }
 }
 
-/** In-process bridge between the test screen, the touch window and the overlay. */
+/** In-process bridge between the test screen, the media watcher, the touch window and the overlay. */
 object IslandController {
+    private const val MEDIA_GONE_HIDE_DELAY_MS = 1500L
+
+    private val main = Handler(Looper.getMainLooper())
+
     private val _mode = MutableStateFlow(IslandMode.HIDDEN)
     val mode: StateFlow<IslandMode> = _mode.asStateFlow()
 
@@ -181,19 +201,138 @@ object IslandController {
     private val _calibration = MutableStateFlow(IslandCalibration())
     val calibration: StateFlow<IslandCalibration> = _calibration.asStateFlow()
 
-    private val _drag = MutableSharedFlow<IslandDrag>(extraBufferCapacity = 64)
-    val drag: SharedFlow<IslandDrag> = _drag.asSharedFlow()
+    /** Compact state a swiped-away island can be brought back to (null = nothing to restore). */
+    private val _restorable = MutableStateFlow<IslandMode?>(null)
+    val restorable: StateFlow<IslandMode?> = _restorable.asStateFlow()
 
+    /** Real media from any app (null = nothing playing / paused). */
+    private val _media = MutableStateFlow<IslandMediaInfo?>(null)
+    val media: StateFlow<IslandMediaInfo?> = _media.asStateFlow()
+
+    /** Whether the media watcher could read sessions (notification access granted). */
+    private val _mediaAccess = MutableStateFlow(false)
+    val mediaAccess: StateFlow<Boolean> = _mediaAccess.asStateFlow()
+
+    /** Session the user swiped / hid away; it does not pop up again until it ends. */
+    private var dismissedSessionKey: String? = null
+
+    /** Last reported on-screen bounds of the music card controls (window == screen coords). */
+    private val buttonRects = HashMap<IslandButton, Rect>()
+
+    private val hideWhenMediaGone = Runnable {
+        if (_media.value == null) {
+            if (_mode.value.isMusic()) _mode.value = IslandMode.HIDDEN
+            if (_restorable.value == IslandMode.COMPACT_MUSIC) _restorable.value = null
+            dismissedSessionKey = null
+        }
+    }
+
+    /** Test buttons: show a mock state. */
     fun show(mode: IslandMode) {
+        if (mode == IslandMode.HIDDEN) {
+            hide()
+            return
+        }
+        _restorable.value = null
         _mode.value = mode
+    }
+
+    /** Hide button: shrink into the camera, nothing left to bring back. */
+    fun hide() {
+        if (_mode.value.isMusic()) dismissedSessionKey = _media.value?.sessionKey
+        _restorable.value = null
+        _mode.value = IslandMode.HIDDEN
     }
 
     fun setCalibration(calibration: IslandCalibration) {
         _calibration.value = calibration
     }
 
-    internal fun emitDrag(event: IslandDrag) {
-        _drag.tryEmit(event)
+    // ---- Gestures (from the small touch window) ----
+
+    /** Horizontal swipe: card -> its compact pill; pill -> into the camera; hidden -> bring back. */
+    fun onSwipe() {
+        when (val m = _mode.value) {
+            IslandMode.EXPANDED -> _mode.value = IslandMode.COMPACT
+            IslandMode.MUSIC -> _mode.value = IslandMode.COMPACT_MUSIC
+            IslandMode.COMPACT, IslandMode.WIDE, IslandMode.COMPACT_MUSIC -> {
+                if (m == IslandMode.COMPACT_MUSIC) dismissedSessionKey = _media.value?.sessionKey
+                _restorable.value = m
+                _mode.value = IslandMode.HIDDEN
+            }
+            IslandMode.HIDDEN -> {
+                val back = _restorable.value ?: return
+                if (back == IslandMode.COMPACT_MUSIC) dismissedSessionKey = null
+                _restorable.value = null
+                _mode.value = back
+            }
+        }
+    }
+
+    /** Tap on the island at screen position (x, y). */
+    fun onTap(x: Float, y: Float) {
+        when (_mode.value) {
+            IslandMode.COMPACT -> _mode.value = IslandMode.EXPANDED
+            IslandMode.COMPACT_MUSIC -> _mode.value = IslandMode.MUSIC
+            IslandMode.MUSIC -> {
+                val hit = buttonRects.entries.firstOrNull { (_, r) -> r.contains(androidx.compose.ui.geometry.Offset(x, y)) }?.key
+                if (hit != null) {
+                    if (_media.value != null) IslandMedia.press(hit)
+                } else if (_media.value != null) {
+                    if (IslandMedia.openApp()) _mode.value = IslandMode.COMPACT_MUSIC
+                }
+            }
+            else -> Unit
+        }
+    }
+
+    /** Pull down on a compact pill: expand it (like a tap). */
+    fun onPullDown() {
+        when (_mode.value) {
+            IslandMode.COMPACT -> _mode.value = IslandMode.EXPANDED
+            IslandMode.COMPACT_MUSIC -> _mode.value = IslandMode.MUSIC
+            else -> Unit
+        }
+    }
+
+    /** A touch anywhere outside the island: an expanded card collapses back to its pill. */
+    fun onOutsideTouch() {
+        when (_mode.value) {
+            IslandMode.EXPANDED -> _mode.value = IslandMode.COMPACT
+            IslandMode.MUSIC -> _mode.value = IslandMode.COMPACT_MUSIC
+            else -> Unit
+        }
+    }
+
+    internal fun setButtonRect(button: IslandButton, rect: Rect, touchPaddingPx: Float) {
+        buttonRects[button] = rect.inflate(touchPaddingPx)
+    }
+
+    // ---- Media ----
+
+    internal fun setMediaAccess(granted: Boolean) {
+        _mediaAccess.value = granted
+    }
+
+    /** Called on the main thread by the media watcher whenever the chosen session changes. */
+    internal fun setMedia(info: IslandMediaInfo?) {
+        val old = _media.value
+        _media.value = info
+        if (info != null) {
+            main.removeCallbacks(hideWhenMediaGone)
+            if (old != null && old.sessionKey != info.sessionKey && dismissedSessionKey == old.sessionKey) {
+                dismissedSessionKey = null
+            }
+            if (info.playing && _mode.value == IslandMode.HIDDEN && dismissedSessionKey != info.sessionKey) {
+                // Music started: grow the compact music pill out of the camera.
+                _restorable.value = null
+                _mode.value = IslandMode.COMPACT_MUSIC
+            }
+        } else if (old != null) {
+            // Stopped / session gone: shrink into the camera after a short grace period.
+            main.removeCallbacks(hideWhenMediaGone)
+            main.postDelayed(hideWhenMediaGone, MEDIA_GONE_HIDE_DELAY_MS)
+        }
     }
 
     internal fun setServiceRunning(running: Boolean) {

@@ -17,7 +17,8 @@ android {
         applicationId = "com.d4viddf.hyperbridge"
         minSdk = 35
         targetSdk = 37
-        versionCode = 33
+        // Island fork builds: 1000 + island phase, always above upstream, so each build installs as an update.
+        versionCode = 1002
         versionName = "0.5.7"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -42,8 +43,18 @@ android {
     buildTypes {
         debug {
             applicationIdSuffix = ".os2test"
-            versionNameSuffix = "-os2test"
+            versionNameSuffix = "-island2"
             signingConfig = signingConfigs.getByName("debug")
+            // Release-like test build (same package + shared key, so it updates in place):
+            // not debuggable, R8-shrunk with the release rules.
+            isDebuggable = false
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro",
+                "proguard-island-test.pro"
+            )
         }
         release {
             isMinifyEnabled = true
