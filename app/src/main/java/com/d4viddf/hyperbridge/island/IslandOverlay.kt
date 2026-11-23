@@ -95,6 +95,22 @@ private val GROW_H: AnimationSpec<Float> = spring(dampingRatio = 0.80f, stiffnes
 private val GROW_POS: AnimationSpec<Float> = spring(dampingRatio = 0.82f, stiffness = 460f)
 // Shrink-then-grow switch: a quick, non-bouncy contraction toward the camera (~3 frames).
 private val CONTRACT: AnimationSpec<Float> = spring(dampingRatio = 1f, stiffness = 1100f)
+// Pill <-> its own card (HyperOS 3 / iOS): one continuous morph, ~200 ms to target, ~1.5% overshoot.
+private val MORPH_W: AnimationSpec<Float> = spring(dampingRatio = 0.78f, stiffness = 620f)
+private val MORPH_H: AnimationSpec<Float> = spring(dampingRatio = 0.80f, stiffness = 550f)
+private val MORPH_POS: AnimationSpec<Float> = spring(dampingRatio = 0.90f, stiffness = 600f)
+// Card -> pill: the same morph reversed, a touch firmer.
+private val COLLAPSE_W: AnimationSpec<Float> = spring(dampingRatio = 0.85f, stiffness = 650f)
+private val COLLAPSE_H: AnimationSpec<Float> = spring(dampingRatio = 0.86f, stiffness = 620f)
+private val COLLAPSE_POS: AnimationSpec<Float> = spring(dampingRatio = 0.92f, stiffness = 650f)
+
+/** Pill <-> its own expanded card: morph directly (no contraction step). */
+private fun isOwnMorph(a: IslandMode, b: IslandMode): Boolean =
+    (a == IslandMode.COMPACT && b == IslandMode.EXPANDED) ||
+            (a == IslandMode.EXPANDED && b == IslandMode.COMPACT) ||
+            (a == IslandMode.COMPACT_MUSIC && b == IslandMode.MUSIC) ||
+            (a == IslandMode.MUSIC && b == IslandMode.COMPACT_MUSIC)
+
 // Dismiss: springs back into the camera without overshoot.
 private val SHRINK: AnimationSpec<Float> = spring(dampingRatio = 1f, stiffness = 620f)
 
@@ -187,6 +203,40 @@ fun IslandOverlay(
                 anim.snapShape(targetOf(IslandMode.HIDDEN))
                 anim.contentAlpha.snapTo(0f)
                 anim.shapeAlpha.snapTo(1f)
+            } else if (from != mode && isOwnMorph(from, mode)) {
+                // Pill <-> its own card: ONE continuous morph of the black shape, no contraction.
+                // Old content fades out during the first ~80 ms while the shape is already moving;
+                // new content fades / scales in during the second half of the growth.
+                anim.shapeAlpha.snapTo(1f)
+                val tgt = targetOf(mode)
+                val expanding = mode.isCard()
+                val startH = anim.h.value
+                coroutineScope {
+                    launch {
+                        if (expanding) anim.animateShape(tgt, MORPH_W, MORPH_H, MORPH_POS)
+                        else anim.animateShape(tgt, COLLAPSE_W, COLLAPSE_H, COLLAPSE_POS)
+                    }
+                    launch {
+                        anim.contentOut()
+                        displayedMode = mode
+                        anim.contentScale.snapTo(if (expanding) 0.92f else 1f)
+                        val threshold = if (expanding) 0.5f else 0.6f
+                        if (abs(tgt.h - startH) > 1f) {
+                            withTimeoutOrNull(300) {
+                                snapshotFlow { anim.h.value }
+                                    .first { (it - startH) / (tgt.h - startH) >= threshold }
+                            }
+                        }
+                        coroutineScope {
+                            launch { anim.contentAlpha.animateTo(1f, tween(180)) }
+                            launch { anim.contentBlur.animateTo(0f, tween(180)) }
+                            launch { anim.contentScale.animateTo(1f, spring(dampingRatio = 0.8f, stiffness = 420f)) }
+                        }
+                    }
+                }
+                displayedMode = mode
+                transitioning = false
+                return@LaunchedEffect
             } else if (from != mode) {
                 anim.contentOut()
                 if (!(from.isCard() && !mode.isCard())) {
@@ -237,6 +287,7 @@ fun IslandOverlay(
 
     // Content is laid out once at its final size and revealed by the morphing clip (no reflow per frame).
     val contentRect = IslandLayout.target(displayedMode, geometry, calibration, d)
+    val cardContent = displayedMode.isCard()
     val contentW = with(density) { contentRect.w.toDp() }
     val contentH = with(density) { contentRect.h.toDp() }
 
@@ -274,7 +325,10 @@ fun IslandOverlay(
                     .requiredSize(contentW, contentH)
                     .graphicsLayer {
                         alpha = anim.contentAlpha.value
-                        val s = anim.contentScale.value
+                        // Cards: content grows with the shape (iOS-like), gently clamped.
+                        val fit = if (cardContent && contentRect.w > 1f)
+                            (anim.w.value / contentRect.w).coerceIn(0.85f, 1.02f) else 1f
+                        val s = anim.contentScale.value * fit
                         scaleX = s
                         scaleY = s
                         val b = anim.contentBlur.value

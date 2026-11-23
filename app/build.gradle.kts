@@ -18,7 +18,7 @@ android {
         minSdk = 35
         targetSdk = 37
         // Island fork builds: 1000 + island phase, always above upstream, so each build installs as an update.
-        versionCode = 1002
+        versionCode = 1003
         versionName = "0.5.7"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -43,7 +43,7 @@ android {
     buildTypes {
         debug {
             applicationIdSuffix = ".os2test"
-            versionNameSuffix = "-island2"
+            versionNameSuffix = "-island2.1"
             signingConfig = signingConfigs.getByName("debug")
             // Release-like test build (same package + shared key, so it updates in place):
             // not debuggable, R8-shrunk with the release rules.

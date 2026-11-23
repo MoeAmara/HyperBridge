@@ -113,7 +113,19 @@ class IslandAccessibilityService : AccessibilityService(), LifecycleOwner, ViewM
     )
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        // The test build does not react to accessibility events.
+        // Track the foreground app so the island hides while you're inside the app that owns it.
+        if (event == null || event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
+        val pkg = event.packageName?.toString() ?: return
+        if (pkg.isEmpty() || pkg in IGNORED_PACKAGES || pkg == currentImePackage()) return
+        IslandController.onForegroundPackage(pkg)
+    }
+
+    private fun currentImePackage(): String? = try {
+        android.provider.Settings.Secure.getString(
+            contentResolver, android.provider.Settings.Secure.DEFAULT_INPUT_METHOD
+        )?.substringBefore('/')
+    } catch (_: Exception) {
+        null
     }
 
     override fun onInterrupt() {}
@@ -274,6 +286,7 @@ class IslandAccessibilityService : AccessibilityService(), LifecycleOwner, ViewM
      *  - any touch outside the island -> collapse an expanded card.
      */
     private inner class IslandTouchView : View(this@IslandAccessibilityService) {
+        private val LONG_PRESS_MS = 400L
         private val density = resources.displayMetrics.density
         private val swipeSlop = 24f * density
         private val flingMinDistance = 8f * density
@@ -283,6 +296,13 @@ class IslandAccessibilityService : AccessibilityService(), LifecycleOwner, ViewM
         private var downY = 0f
         private var fired = false
         private var tracker: VelocityTracker? = null
+        private val longPress = Runnable {
+            if (!fired && IslandController.onLongPress()) {
+                // Consumed: the release must not also count as a tap / swipe.
+                fired = true
+                performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS)
+            }
+        }
 
         override fun onTouchEvent(event: MotionEvent): Boolean {
             when (event.actionMasked) {
@@ -296,12 +316,15 @@ class IslandAccessibilityService : AccessibilityService(), LifecycleOwner, ViewM
                     downX = event.rawX
                     downY = event.rawY
                     fired = false
+                    removeCallbacks(longPress)
+                    postDelayed(longPress, LONG_PRESS_MS)
                 }
                 MotionEvent.ACTION_MOVE -> {
                     tracker?.addMovement(event)
                     if (!fired) {
                         val dx = event.rawX - downX
                         val dy = event.rawY - downY
+                        if (abs(dx) > tapSlop || abs(dy) > tapSlop) removeCallbacks(longPress)
                         if (abs(dx) > swipeSlop && abs(dx) > abs(dy) * 1.2f) {
                             fired = true
                             IslandController.onSwipe()
@@ -312,6 +335,7 @@ class IslandAccessibilityService : AccessibilityService(), LifecycleOwner, ViewM
                     }
                 }
                 MotionEvent.ACTION_UP -> {
+                    removeCallbacks(longPress)
                     val t = tracker
                     var vx = 0f
                     if (t != null) {
@@ -333,6 +357,7 @@ class IslandAccessibilityService : AccessibilityService(), LifecycleOwner, ViewM
                     fired = false
                 }
                 MotionEvent.ACTION_CANCEL -> {
+                    removeCallbacks(longPress)
                     tracker?.recycle()
                     tracker = null
                     fired = false
@@ -411,5 +436,13 @@ class IslandAccessibilityService : AccessibilityService(), LifecycleOwner, ViewM
 
     companion object {
         private const val TAG = "IslandService"
+
+        /** Window events from these never count as "the user switched apps". */
+        private val IGNORED_PACKAGES = setOf(
+            "com.android.systemui",
+            "android",
+            "com.miui.securitycenter.overlay",
+            "com.lbe.security.miui"
+        )
     }
 }

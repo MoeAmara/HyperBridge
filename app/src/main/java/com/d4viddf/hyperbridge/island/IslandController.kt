@@ -216,6 +216,18 @@ object IslandController {
     /** Session the user swiped / hid away; it does not pop up again until it ends. */
     private var dismissedSessionKey: String? = null
 
+    /** Package currently in the foreground (from accessibility window events). */
+    private var foregroundPackage: String? = null
+
+    /**
+     * Compact state hidden because the content's own app is in the foreground (HyperOS hides
+     * the island for the app you're in). Grows back out of the camera when the user leaves it.
+     */
+    private var suppressedMode: IslandMode? = null
+
+    /** After a long-press open, ignore other packages briefly until the owner app shows up. */
+    private var openingOwnerUntil = 0L
+
     /** Last reported on-screen bounds of the music card controls (window == screen coords). */
     private val buttonRects = HashMap<IslandButton, Rect>()
 
@@ -223,6 +235,7 @@ object IslandController {
         if (_media.value == null) {
             if (_mode.value.isMusic()) _mode.value = IslandMode.HIDDEN
             if (_restorable.value == IslandMode.COMPACT_MUSIC) _restorable.value = null
+            if (suppressedMode?.isMusic() == true) suppressedMode = null
             dismissedSessionKey = null
         }
     }
@@ -234,6 +247,7 @@ object IslandController {
             return
         }
         _restorable.value = null
+        suppressedMode = null
         _mode.value = mode
     }
 
@@ -241,6 +255,7 @@ object IslandController {
     fun hide() {
         if (_mode.value.isMusic()) dismissedSessionKey = _media.value?.sessionKey
         _restorable.value = null
+        suppressedMode = null
         _mode.value = IslandMode.HIDDEN
     }
 
@@ -279,11 +294,63 @@ object IslandController {
                 if (hit != null) {
                     if (_media.value != null) IslandMedia.press(hit)
                 } else if (_media.value != null) {
-                    if (IslandMedia.openApp()) _mode.value = IslandMode.COMPACT_MUSIC
+                    openOwnerApp()
                 }
             }
             else -> Unit
         }
+    }
+
+    /** Long-press on a pill or card: open the app that owns the content; hide while it's open. */
+    fun onLongPress(): Boolean = when (_mode.value) {
+        IslandMode.COMPACT_MUSIC, IslandMode.MUSIC -> _media.value != null && openOwnerApp()
+        else -> false
+    }
+
+    private fun openOwnerApp(): Boolean {
+        val owner = _media.value?.packageName ?: return false
+        if (!IslandMedia.openApp()) return false
+        openingOwnerUntil = android.os.SystemClock.uptimeMillis() + 1200L
+        suppressFor(owner)
+        return true
+    }
+
+    /** Hide (shrink into the camera) because [owner]'s app is in front; remember what to bring back. */
+    private fun suppressFor(owner: String) {
+        val m = _mode.value
+        if (m == IslandMode.HIDDEN) return
+        if (ownerOf(m) != owner) return
+        suppressedMode = compactOf(m)
+        _restorable.value = null
+        _mode.value = IslandMode.HIDDEN
+    }
+
+    private fun ownerOf(m: IslandMode): String? = if (m.isMusic()) _media.value?.packageName else null
+
+    private fun compactOf(m: IslandMode): IslandMode = when (m) {
+        IslandMode.MUSIC -> IslandMode.COMPACT_MUSIC
+        IslandMode.EXPANDED -> IslandMode.COMPACT
+        else -> m
+    }
+
+    /** Foreground app changed (accessibility TYPE_WINDOW_STATE_CHANGED, filtered by the service). */
+    fun onForegroundPackage(pkg: String) {
+        val now = android.os.SystemClock.uptimeMillis()
+        val owner = _media.value?.packageName
+        if (now < openingOwnerUntil && pkg != owner) return
+        if (pkg == owner) openingOwnerUntil = 0L
+        if (foregroundPackage == pkg) return
+        foregroundPackage = pkg
+        if (owner != null && pkg == owner) {
+            suppressFor(owner)
+            return
+        }
+        // Left the owner app: grow back out of the camera if the content is still alive.
+        val back = suppressedMode ?: return
+        suppressedMode = null
+        if (_mode.value != IslandMode.HIDDEN) return
+        if (back.isMusic() && _media.value == null) return
+        _mode.value = back
     }
 
     /** Pull down on a compact pill: expand it (like a tap). */
@@ -324,9 +391,18 @@ object IslandController {
                 dismissedSessionKey = null
             }
             if (info.playing && _mode.value == IslandMode.HIDDEN && dismissedSessionKey != info.sessionKey) {
-                // Music started: grow the compact music pill out of the camera.
-                _restorable.value = null
-                _mode.value = IslandMode.COMPACT_MUSIC
+                if (foregroundPackage == info.packageName) {
+                    // Started from inside its own app: stay hidden until the user leaves it.
+                    if (_restorable.value == null) suppressedMode = IslandMode.COMPACT_MUSIC
+                } else if (suppressedMode == null) {
+                    // Music started: grow the compact music pill out of the camera.
+                    _restorable.value = null
+                    _mode.value = IslandMode.COMPACT_MUSIC
+                }
+            } else if (_mode.value.isMusic() && foregroundPackage == info.packageName &&
+                old?.packageName != info.packageName) {
+                // The owner changed to the app that's already in front.
+                suppressFor(info.packageName)
             }
         } else if (old != null) {
             // Stopped / session gone: shrink into the camera after a short grace period.
