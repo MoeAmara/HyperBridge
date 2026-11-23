@@ -1,6 +1,11 @@
 package com.d4viddf.hyperbridge.island
 
 import android.accessibilityservice.AccessibilityService
+import android.app.KeyguardManager
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.res.Configuration
 import android.graphics.PixelFormat
 import android.util.Log
@@ -69,6 +74,39 @@ class IslandAccessibilityService : AccessibilityService(), LifecycleOwner, ViewM
     private var touchJob: Job? = null
     private var mediaJob: Job? = null
     private var mediaWatcher: IslandMediaWatcher? = null
+    private var lockReceiver: BroadcastReceiver? = null
+
+    private fun refreshLocked() {
+        val km = getSystemService(KeyguardManager::class.java)
+        IslandController.setLocked(km?.isKeyguardLocked == true)
+    }
+
+    private fun registerLockReceiver() {
+        if (lockReceiver != null) return
+        val r = object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                when (intent.action) {
+                    Intent.ACTION_USER_PRESENT -> IslandController.setLocked(false)
+                    else -> {
+                        refreshLocked()
+                        // The keyguard may engage a moment after the screen turns off / on.
+                        overlay?.postDelayed({ refreshLocked() }, 600L)
+                    }
+                }
+            }
+        }
+        val f = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_OFF)
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(Intent.ACTION_USER_PRESENT)
+        }
+        try {
+            registerReceiver(r, f)
+            lockReceiver = r
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to register lock receiver", e)
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -82,9 +120,14 @@ class IslandAccessibilityService : AccessibilityService(), LifecycleOwner, ViewM
         lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_RESUME)
         windowManager = getSystemService(WindowManager::class.java)
         IslandController.setCalibration(IslandCalibrationStore.load(this))
+        IslandController.setMotion(IslandCalibrationStore.loadMotion(this))
+        IslandController.setShowOnLock(IslandCalibrationStore.loadShowOnLock(this))
+        IslandMedia.appContext = applicationContext
         IslandController.setServiceRunning(true)
         addOverlay()
         addTouchWindow()
+        registerLockReceiver()
+        refreshLocked()
         touchJob?.cancel()
         touchJob = lifecycleScope.launch {
             combine(
@@ -149,6 +192,8 @@ class IslandAccessibilityService : AccessibilityService(), LifecycleOwner, ViewM
                 IslandStatusBar.run(IslandStatusBar.CMD_RESTORE)
             }
         }
+        lockReceiver?.let { try { unregisterReceiver(it) } catch (_: Exception) {} }
+        lockReceiver = null
         touchJob?.cancel()
         touchJob = null
         mediaJob?.cancel()
@@ -318,13 +363,17 @@ class IslandAccessibilityService : AccessibilityService(), LifecycleOwner, ViewM
                     fired = false
                     removeCallbacks(longPress)
                     postDelayed(longPress, LONG_PRESS_MS)
+                    if (IslandController.mode.value != IslandMode.HIDDEN) IslandController.onPress(true)
                 }
                 MotionEvent.ACTION_MOVE -> {
                     tracker?.addMovement(event)
                     if (!fired) {
                         val dx = event.rawX - downX
                         val dy = event.rawY - downY
-                        if (abs(dx) > tapSlop || abs(dy) > tapSlop) removeCallbacks(longPress)
+                        if (abs(dx) > tapSlop || abs(dy) > tapSlop) {
+                            removeCallbacks(longPress)
+                            IslandController.onPress(false)
+                        }
                         if (abs(dx) > swipeSlop && abs(dx) > abs(dy) * 1.2f) {
                             fired = true
                             IslandController.onSwipe()
@@ -336,6 +385,7 @@ class IslandAccessibilityService : AccessibilityService(), LifecycleOwner, ViewM
                 }
                 MotionEvent.ACTION_UP -> {
                     removeCallbacks(longPress)
+                    IslandController.onPress(false)
                     val t = tracker
                     var vx = 0f
                     if (t != null) {
@@ -358,6 +408,7 @@ class IslandAccessibilityService : AccessibilityService(), LifecycleOwner, ViewM
                 }
                 MotionEvent.ACTION_CANCEL -> {
                     removeCallbacks(longPress)
+                    IslandController.onPress(false)
                     tracker?.recycle()
                     tracker = null
                     fired = false

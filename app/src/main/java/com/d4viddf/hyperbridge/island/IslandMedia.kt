@@ -73,6 +73,7 @@ object IslandMedia {
                 IslandButton.PLAY_PAUSE -> {
                     if (isPlayingState(c.playbackState?.state)) t.pause() else t.play()
                 }
+                else -> Unit
             }
         } catch (e: Exception) {
             Log.e(TAG, "Transport control failed", e)
