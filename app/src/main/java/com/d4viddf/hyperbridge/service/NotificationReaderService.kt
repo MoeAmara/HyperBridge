@@ -23,6 +23,7 @@ import com.d4viddf.hyperbridge.data.db.AppDatabase
 import com.d4viddf.hyperbridge.data.theme.RulesEngine
 import com.d4viddf.hyperbridge.data.theme.ThemeRepository
 import com.d4viddf.hyperbridge.data.widget.WidgetManager
+import com.d4viddf.hyperbridge.island.IslandNotifications
 import com.d4viddf.hyperbridge.models.ActiveIsland
 import com.d4viddf.hyperbridge.models.HyperIslandData
 import com.d4viddf.hyperbridge.models.IslandConfig
@@ -382,6 +383,7 @@ class NotificationReaderService : NotificationListenerService() {
 
     override fun onNotificationRemoved(sbn: StatusBarNotification?, rankingMap: RankingMap?, reason: Int) {
         sbn?.let {
+            try { IslandNotifications.onRemoved(it) } catch (e: Exception) { Log.e(TAG, "Island remove hook", e) }
             if (nativeIslands.remove(it.key)) {
                 updatePermanentIsland()
             }
@@ -597,6 +599,7 @@ class NotificationReaderService : NotificationListenerService() {
     @RequiresPermission(Manifest.permission.POST_NOTIFICATIONS)
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
         sbn?.let {
+            try { IslandNotifications.onPosted(this, it) } catch (e: Exception) { Log.e(TAG, "Island post hook", e) }
             if (it.packageName != packageName) {
                 val extras = it.notification.extras
                 var isNative = false
@@ -1250,6 +1253,7 @@ class NotificationReaderService : NotificationListenerService() {
 
     override fun onListenerConnected() { 
         Log.i(TAG, "HyperBridge Service Connected")
+        try { IslandNotifications.onListenerConnected(this) } catch (e: Exception) { Log.e(TAG, "Island connect hook", e) }
         syncNotifications(refresh = true)
         syncJob?.cancel()
         syncJob = serviceScope.launch {
@@ -1370,7 +1374,13 @@ class NotificationReaderService : NotificationListenerService() {
         }
     }
 
+    override fun onListenerDisconnected() {
+        super.onListenerDisconnected()
+        try { IslandNotifications.onListenerDisconnected(this) } catch (e: Exception) { Log.e(TAG, "Island disconnect hook", e) }
+    }
+
     override fun onDestroy() {
+        try { IslandNotifications.onListenerDisconnected(this) } catch (_: Exception) {}
         super.onDestroy()
         unregisterReceiver(systemReceiver)
         unregisterReceiver(islandClickReceiver)
