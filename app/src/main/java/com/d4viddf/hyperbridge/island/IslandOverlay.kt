@@ -12,6 +12,15 @@ import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.Flag
+import androidx.compose.material.icons.rounded.HourglassBottom
+import androidx.compose.material.icons.rounded.Mic
+import androidx.compose.material.icons.rounded.Stop
+import androidx.compose.material.icons.rounded.Timer
+import androidx.compose.runtime.collectAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -86,6 +95,7 @@ object IslandSpec {
     val HangUpRed = Color(0xFFFF3B30)
     val ButtonGrey = Color(0xFF2C2C2E)
     val MusicGreen = Color(0xFF1DB954)
+    val TimerBlue = Color(0xFF2F6BFF)
 }
 
 // Motion, fitted frame-by-frame to the HyperOS 3 promo (25 fps):
@@ -95,24 +105,16 @@ private val GROW_H: AnimationSpec<Float> = spring(dampingRatio = 0.80f, stiffnes
 private val GROW_POS: AnimationSpec<Float> = spring(dampingRatio = 0.82f, stiffness = 460f)
 // Shrink-then-grow switch: a quick, non-bouncy contraction toward the camera (~3 frames).
 private val CONTRACT: AnimationSpec<Float> = spring(dampingRatio = 1f, stiffness = 1100f)
-// Pill <-> its own card (HyperOS 3 / iOS): one continuous morph, ~200 ms to target, ~1.5% overshoot.
-private val MORPH_W: AnimationSpec<Float> = spring(dampingRatio = 0.78f, stiffness = 620f)
-private val MORPH_H: AnimationSpec<Float> = spring(dampingRatio = 0.80f, stiffness = 550f)
-private val MORPH_POS: AnimationSpec<Float> = spring(dampingRatio = 0.90f, stiffness = 600f)
-// Card -> pill: the same morph reversed, a touch firmer.
-private val COLLAPSE_W: AnimationSpec<Float> = spring(dampingRatio = 0.85f, stiffness = 650f)
-private val COLLAPSE_H: AnimationSpec<Float> = spring(dampingRatio = 0.86f, stiffness = 620f)
-private val COLLAPSE_POS: AnimationSpec<Float> = spring(dampingRatio = 0.92f, stiffness = 650f)
 
 /** Pill <-> its own expanded card: morph directly (no contraction step). */
 private fun isOwnMorph(a: IslandMode, b: IslandMode): Boolean =
-    (a == IslandMode.COMPACT && b == IslandMode.EXPANDED) ||
-            (a == IslandMode.EXPANDED && b == IslandMode.COMPACT) ||
-            (a == IslandMode.COMPACT_MUSIC && b == IslandMode.MUSIC) ||
-            (a == IslandMode.MUSIC && b == IslandMode.COMPACT_MUSIC)
+    a != b && ((b.isCard() && b.compact() == a) || (a.isCard() && a.compact() == b))
 
 // Dismiss: springs back into the camera without overshoot.
 private val SHRINK: AnimationSpec<Float> = spring(dampingRatio = 1f, stiffness = 620f)
+
+/** Progress-driven content entry during a pill <-> card morph (tied to the shape's height). */
+private data class MorphEntry(val startH: Float, val endH: Float, val expanding: Boolean)
 
 /** All animated values of the single morphing shape, in px. */
 private class IslandAnim(start: IslandRectPx, private val blurPx: Float) {
@@ -125,6 +127,7 @@ private class IslandAnim(start: IslandRectPx, private val blurPx: Float) {
     val contentAlpha = Animatable(0f)
     val contentScale = Animatable(1f)
     val contentBlur = Animatable(0f)
+    val press = Animatable(1f)
 
     suspend fun snapShape(t: IslandRectPx) {
         cx.snapTo(t.cx)
@@ -149,6 +152,30 @@ private class IslandAnim(start: IslandRectPx, private val blurPx: Float) {
         }
     }
 
+    /** Staggered morph: [first] dimension starts now, the rest follows after [leadMs]. */
+    suspend fun morphShape(
+        t: IslandRectPx,
+        wSpec: AnimationSpec<Float>,
+        hSpec: AnimationSpec<Float>,
+        posSpec: AnimationSpec<Float>,
+        widthFirst: Boolean,
+        leadMs: Long
+    ) {
+        coroutineScope {
+            launch { cx.animateTo(t.cx, posSpec) }
+            launch {
+                if (!widthFirst && leadMs > 0) delay(leadMs)
+                w.animateTo(t.w, wSpec)
+            }
+            launch {
+                if (widthFirst && leadMs > 0) delay(leadMs)
+                launch { top.animateTo(t.top, posSpec) }
+                launch { r.animateTo(t.r, posSpec) }
+                h.animateTo(t.h, hSpec)
+            }
+        }
+    }
+
     suspend fun contentOut() {
         coroutineScope {
             launch { contentAlpha.animateTo(0f, tween(80, easing = LinearEasing)) }
@@ -167,19 +194,37 @@ fun IslandOverlay(
     val density = LocalDensity.current
     val d = density.density
     val blurPx = with(density) { 6.dp.toPx() }
+    val motion by IslandController.motion.collectAsState()
+    val pressed by IslandController.pressed.collectAsState()
+    val live by IslandController.shownLive.collectAsState()
 
     val latestGeometry by rememberUpdatedState(geometry)
     val latestCalibration by rememberUpdatedState(calibration)
+    val latestMotion by rememberUpdatedState(motion)
 
     fun targetOf(m: IslandMode): IslandRectPx = IslandLayout.target(m, latestGeometry, latestCalibration, d)
 
     val anim = remember { IslandAnim(IslandLayout.camera(geometry, calibration, d), blurPx) }
     var displayedMode by remember { mutableStateOf(IslandMode.HIDDEN) }
     var transitioning by remember { mutableStateOf(false) }
+    var entry by remember { mutableStateOf<MorphEntry?>(null) }
 
-    // 1) Mode transitions: grow out of the camera, shrink-then-grow switches, shrink back into the camera.
+    // Press anticipation: the island squeezes slightly under the finger, then springs back.
+    LaunchedEffect(pressed) {
+        if (pressed) {
+            val s = latestMotion.squeeze.coerceIn(0.85f, 1f)
+            val target = if (displayedMode.isCard()) 1f - (1f - s) / 2f else s
+            anim.press.animateTo(target, tween(60))
+        } else {
+            anim.press.animateTo(1f, spring(dampingRatio = 0.45f, stiffness = 700f))
+        }
+    }
+
+    // 1) Mode transitions: grow out of the camera, pill <-> card morph, shrink-then-grow switches,
+    //    shrink back into the camera.
     LaunchedEffect(mode) {
         transitioning = true
+        entry = null
         val from = displayedMode
         if (mode == IslandMode.HIDDEN) {
             if (from != IslandMode.HIDDEN && anim.shapeAlpha.value > 0f) {
@@ -203,38 +248,45 @@ fun IslandOverlay(
                 anim.snapShape(targetOf(IslandMode.HIDDEN))
                 anim.contentAlpha.snapTo(0f)
                 anim.shapeAlpha.snapTo(1f)
-            } else if (from != mode && isOwnMorph(from, mode)) {
-                // Pill <-> its own card: ONE continuous morph of the black shape, no contraction.
-                // Old content fades out during the first ~80 ms while the shape is already moving;
-                // new content fades / scales in during the second half of the growth.
+            } else if (isOwnMorph(from, mode)) {
+                // Pill <-> its own card: ONE continuous, springy morph (tunable in Island Test).
+                // Width leads height; the new content comes in from blur, tied to the growth.
                 anim.shapeAlpha.snapTo(1f)
                 val tgt = targetOf(mode)
                 val expanding = mode.isCard()
+                val mo = latestMotion
+                val damp = if (expanding) mo.bounce.coerceIn(0.3f, 1f)
+                else (mo.bounce + 0.12f).coerceIn(0.3f, 1f)
+                val stiff = (if (expanding) mo.speed else mo.speed * 1.3f).coerceIn(50f, 3000f)
+                val wSpec = spring<Float>(dampingRatio = damp, stiffness = stiff * 1.15f)
+                val hSpec = spring<Float>(dampingRatio = (damp + 0.04f).coerceAtMost(1f), stiffness = stiff)
+                val posSpec = spring<Float>(dampingRatio = (damp + 0.08f).coerceAtMost(1f), stiffness = stiff)
+                val lead = mo.widthLeadMs.coerceIn(0f, 200f).toLong()
                 val startH = anim.h.value
-                coroutineScope {
-                    launch {
-                        if (expanding) anim.animateShape(tgt, MORPH_W, MORPH_H, MORPH_POS)
-                        else anim.animateShape(tgt, COLLAPSE_W, COLLAPSE_H, COLLAPSE_POS)
-                    }
-                    launch {
-                        anim.contentOut()
-                        displayedMode = mode
-                        anim.contentScale.snapTo(if (expanding) 0.92f else 1f)
-                        val threshold = if (expanding) 0.5f else 0.6f
-                        if (abs(tgt.h - startH) > 1f) {
-                            withTimeoutOrNull(300) {
-                                snapshotFlow { anim.h.value }
-                                    .first { (it - startH) / (tgt.h - startH) >= threshold }
-                            }
+                try {
+                    coroutineScope {
+                        launch {
+                            anim.morphShape(
+                                tgt, wSpec, hSpec, posSpec,
+                                widthFirst = expanding,
+                                leadMs = if (expanding) lead else lead / 2
+                            )
                         }
-                        coroutineScope {
-                            launch { anim.contentAlpha.animateTo(1f, tween(180)) }
-                            launch { anim.contentBlur.animateTo(0f, tween(180)) }
-                            launch { anim.contentScale.animateTo(1f, spring(dampingRatio = 0.8f, stiffness = 420f)) }
+                        launch {
+                            // Old content leaves fast while the shape is already moving.
+                            anim.contentAlpha.animateTo(0f, tween(70, easing = LinearEasing))
+                            anim.contentBlur.snapTo(0f)
+                            anim.contentScale.snapTo(1f)
+                            entry = MorphEntry(startH, tgt.h, expanding)
+                            displayedMode = mode
+                            anim.contentAlpha.snapTo(1f)
                         }
                     }
+                } finally {
+                    entry = null
                 }
                 displayedMode = mode
+                if (anim.contentAlpha.value < 1f) anim.contentAlpha.snapTo(1f)
                 transitioning = false
                 return@LaunchedEffect
             } else if (from != mode) {
@@ -290,6 +342,8 @@ fun IslandOverlay(
     val cardContent = displayedMode.isCard()
     val contentW = with(density) { contentRect.w.toDp() }
     val contentH = with(density) { contentRect.h.toDp() }
+    val entryBlurMax = with(density) { motion.blurDp.coerceIn(0f, 40f).dp.toPx() }
+    val entryDrop = with(density) { 6.dp.toPx() }
 
     // Shared mock clock so the timer keeps running across compact <-> expanded.
     val callSeconds by produceState(initialValue = 5) {
@@ -298,6 +352,7 @@ fun IslandOverlay(
             value += 1
         }
     }
+    val mockClock = formatClock(callSeconds)
 
     Box(Modifier.fillMaxSize()) {
         Box(
@@ -314,6 +369,9 @@ fun IslandOverlay(
                     translationX = anim.cx.value - w / 2f
                     translationY = anim.top.value
                     alpha = anim.shapeAlpha.value
+                    val p = anim.press.value
+                    scaleX = p
+                    scaleY = p
                     shape = RoundedCornerShape(anim.r.value.coerceIn(0f, minOf(w, h) / 2f))
                     clip = true
                 }
@@ -324,24 +382,45 @@ fun IslandOverlay(
                     .wrapContentSize(align = Alignment.Center, unbounded = true)
                     .requiredSize(contentW, contentH)
                     .graphicsLayer {
-                        alpha = anim.contentAlpha.value
                         // Cards: content grows with the shape (iOS-like), gently clamped.
                         val fit = if (cardContent && contentRect.w > 1f)
                             (anim.w.value / contentRect.w).coerceIn(0.85f, 1.02f) else 1f
-                        val s = anim.contentScale.value * fit
-                        scaleX = s
-                        scaleY = s
-                        val b = anim.contentBlur.value
-                        renderEffect = if (b > 0.5f) BlurEffect(b, b, TileMode.Decal) else null
+                        val e = entry
+                        if (e != null) {
+                            val span = e.endH - e.startH
+                            val prog = if (abs(span) > 1f) ((anim.h.value - e.startH) / span).coerceIn(0f, 1f) else 1f
+                            val a = ((prog - 0.35f) / 0.5f).coerceIn(0f, 1f)
+                            alpha = anim.contentAlpha.value * a
+                            val base = if (e.expanding) 0.9f else 0.94f
+                            val s = (base + (1f - base) * a) * fit
+                            scaleX = s
+                            scaleY = s
+                            translationY = (1f - a) * -entryDrop
+                            val b = entryBlurMax * (1f - a)
+                            renderEffect = if (b > 0.5f) BlurEffect(b, b, TileMode.Decal) else null
+                        } else {
+                            alpha = anim.contentAlpha.value
+                            val s = anim.contentScale.value * fit
+                            scaleX = s
+                            scaleY = s
+                            translationY = 0f
+                            val b = anim.contentBlur.value
+                            renderEffect = if (b > 0.5f) BlurEffect(b, b, TileMode.Decal) else null
+                        }
                     }
             ) {
                 when (displayedMode) {
                     IslandMode.HIDDEN -> Box(Modifier.fillMaxSize())
-                    IslandMode.COMPACT -> CompactCallContent(formatClock(callSeconds))
+                    IslandMode.COMPACT -> CompactCallContent(live, mockClock)
                     IslandMode.WIDE -> WideChargingContent()
-                    IslandMode.EXPANDED -> ExpandedCallContent(formatClock(callSeconds))
+                    IslandMode.EXPANDED -> ExpandedCallContent(live, mockClock)
                     IslandMode.MUSIC -> MusicContent(media, mockElapsedSeconds = 44 + callSeconds - 5)
                     IslandMode.COMPACT_MUSIC -> CompactMusicContent(media)
+                    IslandMode.INCOMING -> IncomingCallContent(live)
+                    IslandMode.TIMER_PILL -> TimerPillContent(live, callSeconds)
+                    IslandMode.TIMER_CARD -> TimerCardContent(live, callSeconds)
+                    IslandMode.REC_PILL -> RecPillContent(live, mockClock)
+                    IslandMode.REC_CARD -> RecCardContent(live, mockClock)
                 }
             }
         }
@@ -356,23 +435,65 @@ private fun formatClock(totalSeconds: Int): String {
 
 private val DigitsStyle = TextStyle(fontFeatureSettings = "tnum")
 
+/** Wall clock that ticks while the composable is visible (for live timers). */
 @Composable
-private fun CompactCallContent(time: String) {
+private fun rememberNow(periodMs: Long = 250L): Long {
+    val now by produceState(initialValue = System.currentTimeMillis()) {
+        while (true) {
+            delay(periodMs)
+            value = System.currentTimeMillis()
+        }
+    }
+    return now
+}
+
+/** Soft pulse 0..1 (incoming-call icon, recorder dot). */
+@Composable
+private fun rememberPulse(periodMs: Int = 700): Float {
+    val t = rememberInfiniteTransition(label = "pulse")
+    val v by t.animateFloat(
+        initialValue = 0f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(tween(periodMs, easing = LinearEasing), RepeatMode.Reverse),
+        label = "pulseV"
+    )
+    return v
+}
+
+@Composable
+private fun CompactCallContent(live: IslandLive?, mockTime: String) {
+    val now = rememberNow()
+    val incoming = live?.kind == LiveKind.INCOMING_CALL
+    val pulse = if (incoming) rememberPulse() else 0f
+    val right = when {
+        live == null -> mockTime
+        incoming -> live.title.ifBlank { "Call" }
+        else -> live.timeText(now) ?: live.text.ifBlank { "Call" }
+    }
     Box(Modifier.fillMaxSize().padding(horizontal = 12.dp)) {
         Icon(
             imageVector = Icons.Rounded.Call,
             contentDescription = null,
             tint = IslandSpec.CallGreen,
-            modifier = Modifier.align(Alignment.CenterStart).size(17.dp)
+            modifier = Modifier
+                .align(Alignment.CenterStart)
+                .size(17.dp)
+                .graphicsLayer {
+                    val s = 1f + 0.12f * pulse
+                    scaleX = s
+                    scaleY = s
+                    rotationZ = if (incoming) (pulse - 0.5f) * 24f else 0f
+                }
         )
         Text(
-            text = time,
+            text = right,
             color = IslandSpec.CallGreen,
             fontSize = 13.sp,
             fontWeight = FontWeight.SemiBold,
             style = DigitsStyle,
             maxLines = 1,
-            modifier = Modifier.align(Alignment.CenterEnd)
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.align(Alignment.CenterEnd).widthIn(max = 64.dp)
         )
     }
 }
@@ -411,15 +532,52 @@ private fun WideChargingContent() {
     }
 }
 
+/** Round icon button whose bounds are reported for tap routing. */
 @Composable
-private fun ExpandedCallContent(time: String) {
+private fun RoundButton(
+    button: IslandButton,
+    sizeDp: Int,
+    fill: Color,
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    iconTint: Color = IslandSpec.TextPrimary,
+    ring: Color? = null
+) {
+    val touchPad = with(LocalDensity.current) { 6.dp.toPx() }
+    Box(
+        modifier = Modifier
+            .size(sizeDp.dp)
+            .reportButton(button, touchPad)
+            .clip(CircleShape)
+            .background(fill)
+            .then(if (ring != null) Modifier.border(3.dp, ring, CircleShape) else Modifier),
+        contentAlignment = Alignment.Center
+    ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = null,
+            tint = iconTint,
+            modifier = Modifier.size((sizeDp * 0.5f).dp)
+        )
+    }
+}
+
+@Composable
+private fun ExpandedCallContent(live: IslandLive?, mockTime: String) {
+    val now = rememberNow()
+    val name = live?.title?.ifBlank { null } ?: if (live == null) "Xiaomi" else "Call"
+    val time = if (live == null) mockTime else live.timeText(now) ?: live.text
+    val showSpeaker = live == null || live.action(ActionRole.SPEAKER) != null
     Row(
         modifier = Modifier.fillMaxSize().padding(start = 20.dp, end = 14.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
+        live?.avatar?.let {
+            Image(bitmap = it, contentDescription = null, modifier = Modifier.size(40.dp).clip(CircleShape))
+            Spacer(Modifier.width(12.dp))
+        }
         Column(Modifier.weight(1f)) {
             Text(
-                text = "Xiaomi",
+                text = name,
                 color = IslandSpec.TextPrimary,
                 fontSize = 18.sp,
                 fontWeight = FontWeight.Medium,
@@ -434,28 +592,223 @@ private fun ExpandedCallContent(time: String) {
                 maxLines = 1
             )
         }
+        if (showSpeaker) {
+            RoundButton(IslandButton.SPEAKER, 44, IslandSpec.ButtonGrey, Icons.AutoMirrored.Rounded.VolumeUp)
+            Spacer(Modifier.width(14.dp))
+        }
+        RoundButton(IslandButton.HANG_UP, 52, IslandSpec.HangUpRed, Icons.Rounded.CallEnd)
+    }
+}
+
+@Composable
+private fun IncomingCallContent(live: IslandLive?) {
+    val pulse = rememberPulse(600)
+    val name = live?.title?.ifBlank { null } ?: if (live == null) "Xiaomi" else "Unknown"
+    val sub = live?.text?.ifBlank { null } ?: "Incoming call"
+    Row(
+        modifier = Modifier.fillMaxSize().padding(start = 16.dp, end = 14.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
         Box(
             modifier = Modifier.size(44.dp).clip(CircleShape).background(IslandSpec.ButtonGrey),
             contentAlignment = Alignment.Center
         ) {
-            Icon(
-                imageVector = Icons.AutoMirrored.Rounded.VolumeUp,
-                contentDescription = null,
-                tint = IslandSpec.TextPrimary,
-                modifier = Modifier.size(22.dp)
+            val av = live?.avatar
+            if (av != null) {
+                Image(bitmap = av, contentDescription = null, modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+            } else {
+                Text(
+                    text = name.take(1).uppercase(),
+                    color = IslandSpec.TextPrimary,
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+        }
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f)) {
+            Text(
+                text = name,
+                color = IslandSpec.TextPrimary,
+                fontSize = 17.sp,
+                fontWeight = FontWeight.Medium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Text(
+                text = sub,
+                color = IslandSpec.TextSecondary,
+                fontSize = 13.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
             )
         }
+        RoundButton(IslandButton.DECLINE, 48, IslandSpec.HangUpRed, Icons.Rounded.CallEnd)
         Spacer(Modifier.width(14.dp))
-        Box(
-            modifier = Modifier.size(52.dp).clip(CircleShape).background(IslandSpec.HangUpRed),
-            contentAlignment = Alignment.Center
-        ) {
-            Icon(
-                imageVector = Icons.Rounded.CallEnd,
-                contentDescription = null,
-                tint = IslandSpec.TextPrimary,
-                modifier = Modifier.size(26.dp)
+        Box(Modifier.graphicsLayer {
+            val s = 1f + 0.06f * pulse
+            scaleX = s
+            scaleY = s
+        }) {
+            RoundButton(IslandButton.ANSWER, 48, IslandSpec.CallGreen, Icons.Rounded.Call)
+        }
+    }
+}
+
+/** Timer / stopwatch display time; mock counts down from 04:56 (timer). */
+private fun liveOrMockTime(live: IslandLive?, now: Long, mockSeconds: Int, stopwatch: Boolean): String =
+    if (live == null) formatDuration(if (stopwatch) mockSeconds.toLong() else (296L - mockSeconds).coerceAtLeast(0L))
+    else live.timeText(now) ?: "--:--"
+
+@Composable
+private fun TimerPillContent(live: IslandLive?, mockSeconds: Int) {
+    val now = rememberNow()
+    val stopwatch = live?.kind == LiveKind.STOPWATCH
+    val paused = live?.paused == true
+    Box(Modifier.fillMaxSize().padding(horizontal = 12.dp)) {
+        Icon(
+            imageVector = if (stopwatch) Icons.Rounded.Timer else Icons.Rounded.HourglassBottom,
+            contentDescription = null,
+            tint = IslandSpec.TimerBlue,
+            modifier = Modifier.align(Alignment.CenterStart).size(17.dp)
+        )
+        Text(
+            text = liveOrMockTime(live, now, mockSeconds, stopwatch),
+            color = if (paused) IslandSpec.TextSecondary else IslandSpec.TextPrimary,
+            fontSize = 13.sp,
+            fontWeight = FontWeight.SemiBold,
+            style = DigitsStyle,
+            maxLines = 1,
+            modifier = Modifier.align(Alignment.CenterEnd)
+        )
+    }
+}
+
+@Composable
+private fun TimerCardContent(live: IslandLive?, mockSeconds: Int) {
+    val now = rememberNow()
+    val stopwatch = live?.kind == LiveKind.STOPWATCH
+    val paused = live?.paused == true
+    val label = when {
+        live == null -> "Timer"
+        stopwatch -> "Stopwatch"
+        else -> "Timer"
+    }
+    val primary = live == null || live.action(ActionRole.PAUSE, ActionRole.RESUME) != null
+    val lap = live?.action(ActionRole.LAP)
+    val secondary = live == null || lap != null || live.action(ActionRole.STOP) != null
+    Row(
+        modifier = Modifier.fillMaxSize().padding(start = 18.dp, end = 14.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(
+            imageVector = if (stopwatch) Icons.Rounded.Timer else Icons.Rounded.HourglassBottom,
+            contentDescription = null,
+            tint = IslandSpec.TimerBlue,
+            modifier = Modifier.size(36.dp)
+        )
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f)) {
+            Text(
+                text = liveOrMockTime(live, now, mockSeconds, stopwatch),
+                color = if (paused) IslandSpec.TextSecondary else IslandSpec.TextPrimary,
+                fontSize = 22.sp,
+                fontWeight = FontWeight.Bold,
+                style = DigitsStyle,
+                maxLines = 1
             )
+            Text(text = label, color = IslandSpec.TextSecondary, fontSize = 13.sp, maxLines = 1)
+        }
+        if (primary) {
+            RoundButton(
+                IslandButton.PRIMARY, 52, Color.Transparent,
+                if (paused) Icons.Rounded.PlayArrow else Icons.Rounded.Pause,
+                iconTint = IslandSpec.TimerBlue, ring = IslandSpec.TimerBlue
+            )
+            Spacer(Modifier.width(12.dp))
+        }
+        if (secondary) {
+            RoundButton(
+                IslandButton.SECONDARY, 44, IslandSpec.ButtonGrey,
+                if (stopwatch && lap != null && !paused) Icons.Rounded.Flag else Icons.Rounded.Close
+            )
+        }
+    }
+}
+
+@Composable
+private fun RecDot(pulse: Float, sizeDp: Int) {
+    Box(
+        Modifier
+            .size(sizeDp.dp)
+            .graphicsLayer { alpha = 0.45f + 0.55f * pulse }
+            .clip(CircleShape)
+            .background(IslandSpec.HangUpRed)
+    )
+}
+
+@Composable
+private fun RecPillContent(live: IslandLive?, mockTime: String) {
+    val now = rememberNow()
+    val paused = live?.paused == true
+    val pulse = if (paused) 1f else rememberPulse(800)
+    Box(Modifier.fillMaxSize().padding(horizontal = 14.dp)) {
+        Box(Modifier.align(Alignment.CenterStart)) { RecDot(pulse, 10) }
+        Text(
+            text = if (live == null) mockTime else live.timeText(now) ?: "REC",
+            color = if (paused) IslandSpec.TextSecondary else IslandSpec.TextPrimary,
+            fontSize = 13.sp,
+            fontWeight = FontWeight.SemiBold,
+            style = DigitsStyle,
+            maxLines = 1,
+            modifier = Modifier.align(Alignment.CenterEnd)
+        )
+    }
+}
+
+@Composable
+private fun RecCardContent(live: IslandLive?, mockTime: String) {
+    val now = rememberNow()
+    val paused = live?.paused == true
+    val pulse = if (paused) 1f else rememberPulse(800)
+    val primary = live == null || live.action(ActionRole.PAUSE, ActionRole.RESUME) != null
+    val stop = live == null || live.action(ActionRole.STOP) != null
+    Row(
+        modifier = Modifier.fillMaxSize().padding(start = 20.dp, end = 14.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        RecDot(pulse, 14)
+        Spacer(Modifier.width(14.dp))
+        Column(Modifier.weight(1f)) {
+            Text(
+                text = if (live == null) mockTime else live.timeText(now) ?: "--:--",
+                color = if (paused) IslandSpec.TextSecondary else IslandSpec.TextPrimary,
+                fontSize = 22.sp,
+                fontWeight = FontWeight.Bold,
+                style = DigitsStyle,
+                maxLines = 1
+            )
+            Text(
+                text = when {
+                    paused -> "Paused"
+                    live == null -> "Recording"
+                    else -> live.title.ifBlank { "Recording" }
+                },
+                color = IslandSpec.TextSecondary,
+                fontSize = 13.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+        if (primary) {
+            RoundButton(
+                IslandButton.PRIMARY, 44, IslandSpec.ButtonGrey,
+                if (paused) Icons.Rounded.Mic else Icons.Rounded.Pause
+            )
+            Spacer(Modifier.width(12.dp))
+        }
+        if (stop) {
+            RoundButton(IslandButton.SECONDARY, 52, IslandSpec.HangUpRed, Icons.Rounded.Stop)
         }
     }
 }

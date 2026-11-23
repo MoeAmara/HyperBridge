@@ -26,6 +26,7 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Slider
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -39,6 +40,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.d4viddf.hyperbridge.ui.theme.HyperBridgeTheme
@@ -52,6 +54,7 @@ class IslandTestActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         IslandController.setCalibration(IslandCalibrationStore.load(this))
+        IslandController.setMotion(IslandCalibrationStore.loadMotion(this))
         enableEdgeToEdge()
         setContent {
             HyperBridgeTheme {
@@ -155,6 +158,11 @@ private fun IslandTestScreen(
         }
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             StateButton("Music pill", Modifier.weight(1f)) { IslandController.show(IslandMode.COMPACT_MUSIC) }
+            StateButton("Incoming", Modifier.weight(1f)) { IslandController.show(IslandMode.INCOMING) }
+        }
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            StateButton("Timer", Modifier.weight(1f)) { IslandController.show(IslandMode.TIMER_PILL) }
+            StateButton("Recorder", Modifier.weight(1f)) { IslandController.show(IslandMode.REC_PILL) }
         }
         OutlinedButton(
             onClick = { IslandController.show(IslandMode.HIDDEN) },
@@ -169,7 +177,16 @@ private fun IslandTestScreen(
         )
 
         Spacer(Modifier.height(12.dp))
+        MotionSection()
+
+        Spacer(Modifier.height(12.dp))
+        LockScreenSection()
+
+        Spacer(Modifier.height(12.dp))
         MusicSection(onOpenNotificationAccess)
+
+        Spacer(Modifier.height(12.dp))
+        LiveSection()
 
         Spacer(Modifier.height(12.dp))
         CalibrationSection(
@@ -311,7 +328,7 @@ private fun CalRow(
     onValue: (Float) -> Unit
 ) {
     fun snap(v: Float): Float = ((v / step).roundToInt() * step).coerceIn(min, max)
-    val shown = if (step < 1f) "%.1f".format(value) else "%.0f".format(value)
+    val shown = if (step < 0.1f) "%.2f".format(value) else if (step < 1f) "%.1f".format(value) else "%.0f".format(value)
 
     Column(Modifier.fillMaxWidth()) {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -417,4 +434,84 @@ private fun StateButton(label: String, modifier: Modifier, onClick: () -> Unit) 
         modifier = modifier.height(52.dp),
         colors = ButtonDefaults.buttonColors()
     ) { Text(label) }
+}
+
+
+@Composable
+private fun MotionSection() {
+    val context = LocalContext.current
+    val m by IslandController.motion.collectAsState()
+    fun set(n: IslandMotion) {
+        IslandController.setMotion(n)
+        IslandCalibrationStore.saveMotion(context, n)
+    }
+    Text("Animation tuning", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+    Text(
+        "Pill ↔ card morph. Lower bounce = more wobble. Saved and applied live; tap Replay to preview.",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant
+    )
+    Button(onClick = { IslandController.replayMorph() }, modifier = Modifier.fillMaxWidth()) { Text("Replay (pill ↔ card)") }
+    CalRow("Bounce (damping)", m.bounce, 0.40f, 1.00f, 0.01f, "") { set(m.copy(bounce = it)) }
+    CalRow("Speed (stiffness)", m.speed, 150f, 1200f, 10f, "") { set(m.copy(speed = it)) }
+    CalRow("Width leads height", m.widthLeadMs, 0f, 120f, 5f, "ms") { set(m.copy(widthLeadMs = it)) }
+    CalRow("Content blur", m.blurDp, 0f, 24f, 1f, "dp") { set(m.copy(blurDp = it)) }
+    CalRow("Press squeeze", m.squeeze, 0.90f, 1.00f, 0.01f, "×") { set(m.copy(squeeze = it)) }
+    OutlinedButton(onClick = { set(IslandMotion()) }, modifier = Modifier.fillMaxWidth()) { Text("Reset to defaults") }
+}
+
+@Composable
+private fun LockScreenSection() {
+    val context = LocalContext.current
+    val on by IslandController.showOnLock.collectAsState()
+    val locked by IslandController.locked.collectAsState()
+    Text("Lock screen", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Text("Show on lock screen", modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
+        Switch(checked = on, onCheckedChange = {
+            IslandCalibrationStore.saveShowOnLock(context, it)
+            IslandController.setShowOnLock(it)
+        })
+    }
+    Text(
+        "Off: the island shrinks into the camera while locked and comes back after unlock. " +
+                "On: it stays on the lock screen (tap / controls work; long-press open is ignored while locked). " +
+                "Keyguard now: ${if (locked) "locked" else "unlocked"}. Always-on display is not covered.",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant
+    )
+}
+
+@Composable
+private fun LiveSection() {
+    val context = LocalContext.current
+    val live by IslandController.live.collectAsState()
+    var dump by remember { mutableStateOf("") }
+    Text("Calls · timers · recorder (real)", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+    Text(
+        if (live.isEmpty()) "Detected now: nothing"
+        else "Detected now:\n" + live.joinToString("\n") {
+            "• ${it.kind.name} — ${it.title.ifBlank { it.packageName }} (${it.packageName})" +
+                    (it.timeText()?.let { t -> " $t" } ?: "") + if (it.paused) " paused" else ""
+        },
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant
+    )
+    Text("Notification inspector", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+        OutlinedButton(onClick = { dump = IslandNotifications.inspect() }, modifier = Modifier.weight(1f)) {
+            Text("Refresh")
+        }
+        OutlinedButton(
+            onClick = {
+                if (dump.isEmpty()) dump = IslandNotifications.inspect()
+                val cm = context.getSystemService(android.content.ClipboardManager::class.java)
+                cm?.setPrimaryClip(android.content.ClipData.newPlainText("Island inspector", dump))
+            },
+            modifier = Modifier.weight(1f)
+        ) { Text("Copy") }
+    }
+    if (dump.isNotEmpty()) {
+        Text(dump, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
 }
