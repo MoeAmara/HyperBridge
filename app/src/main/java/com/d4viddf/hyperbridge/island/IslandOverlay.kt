@@ -16,6 +16,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -350,31 +351,84 @@ fun IslandOverlay(
     /** A liquid swap is running: the bubble effect waits, the ghost shape is drawn. */
     var swapping by remember { mutableStateOf<GhostInfo?>(null) }
     var handledSwap by remember { mutableIntStateOf(swap?.seq ?: 0) }
+    /** Velocity (cx, top, size) a settled ghost hands to the bubble, so it keeps moving smoothly. */
+    var bubbleCarry by remember { mutableStateOf<FloatArray?>(null) }
+
+    /**
+     * A swap that was interrupted (its effect cancelled mid-flight) leaves its ghost on screen. Before
+     * any non-swap animation, the ghost turns into the real bubble right where it is, so nothing can
+     * stay frozen; the bubble effect then springs it to its slot. (No suspend work in `finally`: a
+     * cancelled coroutine throws at the first suspend call, which used to skip this hand-over.)
+     */
+    suspend fun settleLeftoverSwap() {
+        val g = swapping ?: return
+        val size = minOf(ghost.w.value, ghost.h.value).coerceAtLeast(1f)
+        val vSize = if (ghost.w.value <= ghost.h.value) ghost.w.velocity else ghost.h.velocity
+        val vx = ghost.cx.velocity
+        val vy = ghost.top.velocity
+        bAnim.cx.snapTo(ghost.cx.value)
+        bAnim.top.snapTo(ghost.top.value + (ghost.h.value - size) / 2f)
+        bAnim.size.snapTo(size)
+        bAnim.content.snapTo(ghost.newContent.value)
+        bAnim.alpha.snapTo(if (latestBubble != null) 1f else 0f)
+        bubbleCarry = floatArrayOf(vx, vy, vSize)
+        shownBubble = g.bubble
+        swapping = null
+    }
 
     LaunchedEffect(mode, swap?.seq) {
+        val sw = latestSwap
+        // The swap is published one moment before its mode: wait for the mode instead of animating twice.
+        if (sw != null && sw.seq != handledSwap && sw.newMain != sw.oldMain && mode == sw.oldMain && mode != sw.newMain) {
+            return@LaunchedEffect
+        }
         transitioning = true
         morph = null
         val from = displayedMode
-        val sw = latestSwap
         if (sw != null && sw.seq != handledSwap) {
             handledSwap = sw.seq
             val newBubble = latestBubble
             val bubbleSlot = planOf(mode).bubble
+            val prevGhost = swapping
+            val bubbleVisible = prevGhost != null || bAnim.alpha.value > 0.5f
             if (mode != IslandMode.HIDDEN && from == sw.oldMain && anim.shapeAlpha.value > 0.5f &&
-                bAnim.alpha.value > 0.5f && newBubble != null && bubbleSlot != null
+                bubbleVisible && newBubble != null && bubbleSlot != null
             ) {
                 // ---- Liquid swap: the bubble grows into the main shape while the main shrinks into the slot.
+                // Interruptible: every shape starts from where it is NOW, with its current velocity,
+                // so tapping again mid-swap simply reverses / retargets the motion (no jumps, no restarts).
                 val mo = latestMotion
                 val damping = mo.bounce.coerceIn(0.3f, 1f)
                 val stiffness = mo.speed.coerceIn(60f, 3000f)
                 val sp = spring<Float>(dampingRatio = damping, stiffness = stiffness)
                 val fadeSpec = spring<Float>(dampingRatio = 1f, stiffness = (stiffness * 4f).coerceIn(300f, 8000f))
+
+                // Where the tapped item is right now: the in-flight ghost (interrupted swap) or the bubble.
+                val tapRect: IslandRectPx
+                val tapV: FloatArray // cx, top, w, h, r
+                val tapContent: Float
+                val tapCard: Float
+                if (prevGhost != null) {
+                    tapRect = IslandRectPx(ghost.cx.value, ghost.top.value, ghost.w.value, ghost.h.value, ghost.r.value)
+                    tapV = floatArrayOf(ghost.cx.velocity, ghost.top.velocity, ghost.w.velocity, ghost.h.velocity, ghost.r.velocity)
+                    tapContent = ghost.oldContent.value
+                    tapCard = ghost.cardness.value
+                } else {
+                    val bs = bAnim.size.value
+                    tapRect = IslandRectPx(bAnim.cx.value, bAnim.top.value, bs, bs, bs / 2f)
+                    tapV = floatArrayOf(bAnim.cx.velocity, bAnim.top.velocity, bAnim.size.velocity, bAnim.size.velocity, bAnim.size.velocity / 2f)
+                    tapContent = 0f
+                    tapCard = 0f
+                }
+                // Where the old main is right now (jelly included), with its velocity.
                 val oldMainRect = IslandRectPx(
                     anim.cx.value, anim.top.value,
                     anim.w.value * anim.jx.value, anim.h.value * anim.jy.value, anim.r.value
                 )
-                val oldBubbleSize = bAnim.size.value
-                val oldBubbleRect = IslandRectPx(bAnim.cx.value, bAnim.top.value, oldBubbleSize, oldBubbleSize, oldBubbleSize / 2f)
+                val mainV = floatArrayOf(anim.cx.velocity, anim.top.velocity, anim.w.velocity, anim.h.velocity, anim.r.velocity)
+                val mainContent = if (anim.contentAlpha.value.isNaN()) 1f else anim.contentAlpha.value
+                val mainCard = anim.cardness.value
+
                 val info = GhostInfo(
                     mode = sw.oldMain,
                     stopwatch = sw.oldMainStopwatch,
@@ -386,56 +440,63 @@ fun IslandOverlay(
                         true, sw.oldMainStopwatch
                     )
                 )
-                // Ghost = the old main, starting exactly where it is now.
-                ghost.snap(oldMainRect, anim.cardness.value)
-                ghost.oldContent.snapTo(1f)
+                // Ghost = the old main, exactly where it is now.
+                ghost.snap(oldMainRect, mainCard)
+                ghost.oldContent.snapTo(mainContent.coerceIn(0f, 1f))
                 ghost.newContent.snapTo(0f)
                 swapping = info
                 bAnim.alpha.snapTo(0f)
                 shownBubble = newBubble
-                // Main = the tapped item, starting as the bubble circle it was.
-                anim.snapShape(oldBubbleRect)
+                // Main = the tapped item, exactly where it is now.
+                anim.snapShape(tapRect)
                 anim.jx.snapTo(1f)
                 anim.jy.snapTo(1f)
-                anim.cardness.snapTo(0f)
+                anim.cardness.snapTo(tapCard)
                 anim.shapeAlpha.snapTo(1f)
-                anim.contentAlpha.snapTo(0f)
-                anim.contentBlur.snapTo(blurPx)
+                anim.contentAlpha.snapTo(tapContent.coerceIn(0f, 1f))
+                anim.contentBlur.snapTo(blurPx * (1f - tapContent.coerceIn(0f, 1f)))
                 anim.contentScale.snapTo(1f)
                 displayedMode = mode
                 val tgt = targetOf(mode)
-                try {
-                    coroutineScope {
-                        launch { anim.animateShape(tgt, sp, sp, sp) }
-                        launch { anim.cardness.animateTo(if (mode.isCard()) 1f else 0f, tween(220)) }
-                        launch {
-                            delay(60)
-                            coroutineScope {
-                                launch { anim.contentAlpha.animateTo(1f, fadeSpec) }
-                                launch { anim.contentBlur.animateTo(0f, tween(220)) }
-                            }
-                        }
-                        launch { ghost.animateTo(bubbleSlot, sp) }
-                        launch { ghost.cardness.animateTo(0f, tween(200)) }
-                        launch { ghost.oldContent.animateTo(0f, tween(130, easing = LinearEasing)) }
-                        launch {
-                            delay(110)
-                            ghost.newContent.animateTo(1f, tween(170))
+                coroutineScope {
+                    launch { anim.cx.animateTo(tgt.cx, sp, tapV[0]) }
+                    launch { anim.top.animateTo(tgt.top, sp, tapV[1]) }
+                    launch { anim.w.animateTo(tgt.w, sp, tapV[2]) }
+                    launch { anim.h.animateTo(tgt.h, sp, tapV[3]) }
+                    launch { anim.r.animateTo(tgt.r, sp, tapV[4]) }
+                    launch { anim.cardness.animateTo(if (mode.isCard()) 1f else 0f, tween(220)) }
+                    launch {
+                        if (tapContent < 0.5f) delay(60)
+                        coroutineScope {
+                            launch { anim.contentAlpha.animateTo(1f, fadeSpec) }
+                            launch { anim.contentBlur.animateTo(0f, tween(220)) }
                         }
                     }
-                } finally {
-                    // Hand over to the real bubble at the same place, same content.
-                    bAnim.cx.snapTo(bubbleSlot.cx)
-                    bAnim.top.snapTo(bubbleSlot.top)
-                    bAnim.size.snapTo(bubbleSlot.w)
-                    bAnim.content.snapTo(1f)
-                    bAnim.alpha.snapTo(1f)
-                    swapping = null
+                    launch { ghost.cx.animateTo(bubbleSlot.cx, sp, mainV[0]) }
+                    launch { ghost.top.animateTo(bubbleSlot.top, sp, mainV[1]) }
+                    launch { ghost.w.animateTo(bubbleSlot.w, sp, mainV[2]) }
+                    launch { ghost.h.animateTo(bubbleSlot.h, sp, mainV[3]) }
+                    launch { ghost.r.animateTo(bubbleSlot.r, sp, mainV[4]) }
+                    launch { ghost.cardness.animateTo(0f, tween(200)) }
+                    launch { ghost.oldContent.animateTo(0f, tween(130, easing = LinearEasing)) }
+                    launch {
+                        delay(110)
+                        ghost.newContent.animateTo(1f, tween(170))
+                    }
                 }
+                // Completed (not interrupted): hand over to the real bubble at the same place, same content.
+                bAnim.cx.snapTo(ghost.cx.value)
+                bAnim.top.snapTo(ghost.top.value)
+                bAnim.size.snapTo(ghost.w.value)
+                bAnim.content.snapTo(1f)
+                bAnim.alpha.snapTo(1f)
+                swapping = null
                 transitioning = false
                 return@LaunchedEffect
             }
         }
+        // Not a swap: an interrupted swap's ghost becomes the real bubble first (never left frozen).
+        settleLeftoverSwap()
         if (mode == IslandMode.HIDDEN) {
             if (from != IslandMode.HIDDEN && anim.shapeAlpha.value > 0f) {
                 anim.contentOut()
@@ -498,9 +559,10 @@ fun IslandOverlay(
                         if (mo.jelly) launch { anim.jelly(expanding, mo.jellyAmount, damping) }
                     }
                 } finally {
+                    // Non-suspending only: a suspend call here would throw if this run was cancelled.
                     morph = null
-                    anim.fade.snapTo(1f)
                 }
+                anim.fade.snapTo(1f)
                 transitioning = false
                 return@LaunchedEffect
             } else if (from != mode) {
@@ -615,10 +677,13 @@ fun IslandOverlay(
                         launch { bAnim.size.animateTo(bubbleTarget.w, sp) }
                     }
                 } else {
+                    // Keeps the velocity a settled (interrupted) swap ghost handed over, if any.
+                    val carry = bubbleCarry
+                    bubbleCarry = null
                     coroutineScope {
-                        launch { bAnim.cx.animateTo(bubbleTarget.cx, sp) }
-                        launch { bAnim.top.animateTo(bubbleTarget.top, sp) }
-                        launch { bAnim.size.animateTo(bubbleTarget.w, sp) }
+                        launch { bAnim.cx.animateTo(bubbleTarget.cx, sp, carry?.get(0) ?: bAnim.cx.velocity) }
+                        launch { bAnim.top.animateTo(bubbleTarget.top, sp, carry?.get(1) ?: bAnim.top.velocity) }
+                        launch { bAnim.size.animateTo(bubbleTarget.w, sp, carry?.get(2) ?: bAnim.size.velocity) }
                     }
                 }
             }
@@ -1514,11 +1579,19 @@ private fun hash01(i: Long): Float {
  * to the right of it only small grey stubs. Frozen while paused.
  */
 @Composable
-private fun LiveWaveform(widthDp: Dp, heightDp: Dp, running: Boolean, playhead: Float = 0.62f) {
+private fun LiveWaveform(
+    widthDp: Dp,
+    heightDp: Dp,
+    running: Boolean,
+    playhead: Float = 0.62f,
+    stepDp: Dp = 4.dp,
+    barDp: Dp = 2.dp,
+    headDp: Dp = 2.dp
+) {
     val clock = rememberFrameClock(running)
     Canvas(Modifier.width(widthDp).height(heightDp)) {
-        val step = 4.dp.toPx()
-        val barW = 2.dp.toPx()
+        val step = stepDp.toPx()
+        val barW = barDp.toPx()
         val count = (size.width / step).toInt() + 2
         val phase = clock.value / 110.0 // one bar every 110 ms
         val whole = floor(phase).toLong()
@@ -1543,7 +1616,7 @@ private fun LiveWaveform(widthDp: Dp, heightDp: Dp, running: Boolean, playhead: 
             val top = (size.height - h) / 2f
             drawLine(col, Offset(x + barW / 2f, top), Offset(x + barW / 2f, top + h), strokeWidth = barW, cap = StrokeCap.Round)
         }
-        drawLine(IslandSpec.RecRed, Offset(headX, 0f), Offset(headX, size.height), strokeWidth = 2.dp.toPx(), cap = StrokeCap.Round)
+        drawLine(IslandSpec.RecRed, Offset(headX, 0f), Offset(headX, size.height), strokeWidth = headDp.toPx(), cap = StrokeCap.Round)
     }
 }
 
@@ -1856,38 +1929,54 @@ private fun MusicContent(media: IslandMediaInfo?, mockElapsedSeconds: Int) {
 // ---- Second-activity bubble ------------------------------------------------------------------
 
 /** Content of the black circle left of the pill. */
+/**
+ * What the second-activity circle shows: the SAME animated icons as the pills / cards, scaled to the
+ * circle (so a bigger bubble from Layout gets bigger icons): album art, green phone (pulsing when
+ * ringing), draining hourglass inside a depleting ring, ticking stopwatch, live recorder waveform.
+ */
 @Composable
 private fun BubbleContent(b: IslandBubble, media: IslandMediaInfo?, mockSeconds: Int) {
     val live = b.live
-    when (b.kind) {
-        BubbleKind.MUSIC -> {
-            val art = media?.art
-            if (art != null) {
-                Image(
-                    bitmap = art,
-                    contentDescription = null,
-                    contentScale = ContentScale.Crop,
-                    modifier = Modifier.fillMaxSize().padding(3.dp).clip(CircleShape)
-                )
-            } else {
-                Icon(Icons.Rounded.MusicNote, null, tint = media?.accent ?: IslandSpec.MusicGreen, modifier = Modifier.size(18.dp))
+    BoxWithConstraints(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        val s = minOf(maxWidth, maxHeight).let { if (it.value <= 0f) 32.dp else it }
+        when (b.kind) {
+            BubbleKind.MUSIC -> {
+                val art = media?.art
+                if (art != null) {
+                    Image(
+                        bitmap = art,
+                        contentDescription = null,
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier.fillMaxSize().padding(s * 0.09f).clip(CircleShape)
+                    )
+                } else {
+                    Icon(Icons.Rounded.MusicNote, null, tint = media?.accent ?: IslandSpec.MusicGreen, modifier = Modifier.size(s * 0.56f))
+                }
             }
-        }
-        BubbleKind.CALL -> Icon(Icons.Rounded.Call, null, tint = IslandSpec.CallGreen, modifier = Modifier.size(18.dp))
-        BubbleKind.INCOMING -> {
-            val pulse = rememberPulse(650)
-            Icon(
-                Icons.Rounded.Call, null, tint = IslandSpec.CallGreen,
-                modifier = Modifier.size(18.dp).graphicsLayer { rotationZ = (pulse - 0.5f) * 22f }
-            )
-        }
-        BubbleKind.TIMER -> {
-            val now = rememberNow()
-            val paused = live?.paused == true
-            val fraction = bubbleTimerFraction(live, now, mockSeconds)
-            Box(contentAlignment = Alignment.Center) {
-                Canvas(Modifier.size(24.dp)) {
-                    val stroke = 2.dp.toPx()
+            BubbleKind.CALL -> Icon(Icons.Rounded.Call, null, tint = IslandSpec.CallGreen, modifier = Modifier.size(s * 0.54f))
+            BubbleKind.INCOMING -> {
+                val pulse = rememberPulse(650)
+                // Soft green glow breathing behind the phone, like the incoming pill.
+                Box(
+                    Modifier
+                        .size(s * 0.82f)
+                        .graphicsLayer { alpha = 0.25f + 0.45f * pulse }
+                        .background(
+                            Brush.radialGradient(listOf(IslandSpec.CallGreen.copy(alpha = 0.6f), Color.Transparent)),
+                            CircleShape
+                        )
+                )
+                Icon(
+                    Icons.Rounded.Call, null, tint = IslandSpec.CallGreen,
+                    modifier = Modifier.size(s * 0.54f).graphicsLayer { rotationZ = (pulse - 0.5f) * 22f }
+                )
+            }
+            BubbleKind.TIMER -> {
+                val now = rememberNow()
+                val paused = live?.paused == true
+                val fraction = bubbleTimerFraction(live, now, mockSeconds)
+                Canvas(Modifier.size(s * 0.78f)) {
+                    val stroke = (size.minDimension * 0.085f).coerceAtLeast(1.5f)
                     drawCircle(IslandSpec.TimerBlue.copy(alpha = 0.25f), radius = size.minDimension / 2f - stroke / 2f, style = Stroke(stroke))
                     drawArc(
                         color = IslandSpec.TimerBlue,
@@ -1899,28 +1988,25 @@ private fun BubbleContent(b: IslandBubble, media: IslandMediaInfo?, mockSeconds:
                         style = Stroke(stroke, cap = StrokeCap.Round)
                     )
                 }
-                AnimatedHourglass(12.dp, !paused)
+                AnimatedHourglass(s * 0.42f, !paused)
             }
-        }
-        BubbleKind.STOPWATCH -> {
-            val paused = live?.paused == true
-            AnimatedStopwatch(17.dp, !paused) { live?.elapsedMs() ?: (mockSeconds * 1000L) }
-        }
-        BubbleKind.RECORDER -> {
-            val paused = live?.paused == true
-            val pulse = rememberPulse(600)
-            Box(
-                Modifier
-                    .size(10.dp)
-                    .graphicsLayer {
-                        val k = if (paused) 1f else 0.8f + 0.35f * pulse
-                        scaleX = k
-                        scaleY = k
-                        alpha = if (paused) 0.5f else 0.7f + 0.3f * pulse
-                    }
-                    .clip(CircleShape)
-                    .background(IslandSpec.RecRed)
-            )
+            BubbleKind.STOPWATCH -> {
+                val paused = live?.paused == true
+                AnimatedStopwatch(s * 0.6f, !paused) { live?.elapsedMs() ?: (mockSeconds * 1000L) }
+            }
+            BubbleKind.RECORDER -> {
+                // The recorder pill's live waveform, fitted inside the circle: bars scroll past the red playhead.
+                val paused = live?.paused == true
+                LiveWaveform(
+                    widthDp = s * 0.64f,
+                    heightDp = s * 0.44f,
+                    running = !paused,
+                    playhead = 0.6f,
+                    stepDp = (s * 0.095f).coerceIn(2.4.dp, 4.dp),
+                    barDp = (s * 0.05f).coerceIn(1.2.dp, 2.dp),
+                    headDp = (s * 0.05f).coerceIn(1.2.dp, 2.dp)
+                )
+            }
         }
     }
 }

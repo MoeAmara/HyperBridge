@@ -881,7 +881,14 @@ object IslandController {
      * Bumped when the main content and the bubble trade places (tap on the bubble). The overlay then
      * runs the liquid swap: the bubble grows into the main shape, the main shrinks into the bubble slot.
      */
-    data class Swap(val seq: Int, val oldMain: IslandMode, val oldMainStopwatch: Boolean, val oldBubble: IslandBubble)
+    data class Swap(
+        val seq: Int,
+        val oldMain: IslandMode,
+        val oldMainStopwatch: Boolean,
+        val oldBubble: IslandBubble,
+        /** The mode the island switches to with this swap (the overlay waits for it before animating). */
+        val newMain: IslandMode
+    )
 
     private val _swap = MutableStateFlow<Swap?>(null)
     val swap: StateFlow<Swap?> = _swap.asStateFlow()
@@ -1191,10 +1198,12 @@ object IslandController {
         val m = _mode.value
         val wasCard = m.isCard()
         fun target(pill: IslandMode): IslandMode = if (wasCard) pill.card() ?: pill else pill
-        _swap.value = Swap(++swapSeq, m, _mockStopwatch.value || _shownLive.value?.kind == LiveKind.STOPWATCH, b)
+        val oldSw = _mockStopwatch.value || _shownLive.value?.kind == LiveKind.STOPWATCH
         if (b.id == null) {
             // Mock: swap the two mock contents.
             val newMain = target(pillOf(b.kind))
+            // Published first, then the mode: the overlay waits until the mode matches newMain.
+            _swap.value = Swap(++swapSeq, m, oldSw, b, newMain)
             val newBubble = bubbleOfMock(m)
             val sw = b.kind == BubbleKind.STOPWATCH
             setMode(newMain, null, emptyList())
@@ -1205,13 +1214,15 @@ object IslandController {
         }
         val acts = activities()
         val a = acts.firstOrNull { it.id == b.id } ?: return
+        val newMain = target(compactModeOf(a))
+        _swap.value = Swap(++swapSeq, m, oldSw, b, newMain)
         swapHold = a.id
         suppressed -= a.id
         if (restorableId == a.id) {
             restorableId = null
             _restorable.value = null
         }
-        setMode(target(compactModeOf(a)), a.id, acts)
+        setMode(newMain, a.id, acts)
         updateBubble()
     }
 
