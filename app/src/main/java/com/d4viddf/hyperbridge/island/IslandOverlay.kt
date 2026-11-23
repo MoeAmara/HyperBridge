@@ -72,7 +72,9 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.BlurEffect
+import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
@@ -86,6 +88,7 @@ import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.text.TextMeasurer
 import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.layout.boundsInWindow
@@ -110,6 +113,7 @@ import kotlin.math.max
 import kotlin.math.floor
 import kotlin.math.roundToInt
 import kotlin.math.sin
+import kotlin.math.PI
 import kotlin.math.sqrt
 
 /** Colours of the island (sizes live in IslandLayout). */
@@ -256,9 +260,10 @@ private fun pillSlots(
     d: Float,
     g: IslandGeometry,
     c: IslandCalibration,
-    stopwatch: Boolean
+    stopwatch: Boolean,
+    outgoing: Boolean = false
 ): PillSlots? {
-    val type = IslandLayout.pillTypeOf(mode, stopwatch) ?: return null
+    val type = IslandLayout.pillTypeOf(mode, stopwatch, outgoing) ?: return null
     if (mode.isCard()) return null
     val res = IslandLayout.pillResolved(type, g, c, d)
     val icon = res.iconDp
@@ -269,6 +274,10 @@ private fun pillSlots(
         softWrap = false,
         maxLines = 1
     ).size.width.toFloat()
+    if (type == PillType.OUTGOING) {
+        // Left: phone icon + gap + "Ringing". The right (name) never widens the pill; it is shortened instead.
+        return PillSlots(icon * d + OUTGOING_ICON_GAP_DP * d + textW(RINGING_TEXT, text.sp, false) + 1.5f * d, 0f)
+    }
     return when (mode) {
         IslandMode.COMPACT, IslandMode.TIMER_PILL, IslandMode.REC_PILL -> {
             val t = pillTimeText(mode, live, mockSeconds) ?: return null
@@ -299,6 +308,7 @@ fun IslandOverlay(
     val bubble by IslandController.bubble.collectAsState()
     val blurState by IslandController.blurState.collectAsState()
     val mockStopwatch by IslandController.mockStopwatch.collectAsState()
+    val mockOutgoing by IslandController.mockOutgoing.collectAsState()
     val swap by IslandController.swap.collectAsState()
     val layoutPreview by IslandController.layoutPreview.collectAsState()
     val latestPreview by rememberUpdatedState(layoutPreview)
@@ -319,19 +329,23 @@ fun IslandOverlay(
     val latestMock by rememberUpdatedState(mockSeconds)
     val latestBubble by rememberUpdatedState(bubble)
     val latestStopwatch by rememberUpdatedState(mockStopwatch)
+    val latestOutgoing by rememberUpdatedState(mockOutgoing)
     val latestSwap by rememberUpdatedState(swap)
 
     fun isStopwatch(l: IslandLive?, mock: Boolean) = l?.kind == LiveKind.STOPWATCH || (l == null && mock)
+
+    fun isOutgoing(l: IslandLive?, mock: Boolean) = l?.outgoing == true || (l == null && mock)
 
     fun withBubble(m: IslandMode, b: IslandBubble?): Boolean = b != null && m != IslandMode.HIDDEN
 
     fun planOf(m: IslandMode): IslandPlan {
         val sw = isStopwatch(latestLive, latestStopwatch)
+        val og = isOutgoing(latestLive, latestOutgoing)
         return IslandLayout.plan(
             m, latestGeometry, latestCalibration, d,
-            pillSlots(m, latestLive, latestMock, textMeasurer, d, latestGeometry, latestCalibration, sw),
+            pillSlots(m, latestLive, latestMock, textMeasurer, d, latestGeometry, latestCalibration, sw, og),
             withBubble(m, latestBubble),
-            sw
+            sw, og
         )
     }
 
@@ -438,8 +452,11 @@ fun IslandOverlay(
                     bubble = newBubble,
                     fromPlan = IslandLayout.plan(
                         sw.oldMain, latestGeometry, latestCalibration, d,
-                        pillSlots(sw.oldMain, newBubble.live, latestMock, textMeasurer, d, latestGeometry, latestCalibration, sw.oldMainStopwatch),
-                        true, sw.oldMainStopwatch
+                        pillSlots(
+                            sw.oldMain, newBubble.live, latestMock, textMeasurer, d, latestGeometry, latestCalibration,
+                            sw.oldMainStopwatch, isOutgoing(newBubble.live, latestOutgoing)
+                        ),
+                        true, sw.oldMainStopwatch, isOutgoing(newBubble.live, latestOutgoing)
                     )
                 )
                 // Ghost = the old main, exactly where it is now.
@@ -622,11 +639,12 @@ fun IslandOverlay(
     // The plan for what is requested right now (measured content + bubble), used for following,
     // for the touch window and for the bubble.
     val stopwatchNow = isStopwatch(live, mockStopwatch)
+    val outgoingNow = isOutgoing(live, mockOutgoing)
     val livePlan = IslandLayout.plan(
         mode, geometry, calibration, d,
-        pillSlots(mode, live, mockSeconds, textMeasurer, d, geometry, calibration, stopwatchNow),
+        pillSlots(mode, live, mockSeconds, textMeasurer, d, geometry, calibration, stopwatchNow, outgoingNow),
         withBubble(mode, bubble),
-        stopwatchNow
+        stopwatchNow, outgoingNow
     )
     LaunchedEffect(livePlan, mode) {
         IslandController.setLayout(if (mode == IslandMode.HIDDEN) null else livePlan.main, livePlan.bubble)
@@ -923,9 +941,9 @@ fun IslandOverlay(
                 }
                 val shownPlan = if (displayedMode == mode) livePlan else IslandLayout.plan(
                     displayedMode, geometry, calibration, d,
-                    pillSlots(displayedMode, live, mockSeconds, textMeasurer, d, geometry, calibration, stopwatchNow),
+                    pillSlots(displayedMode, live, mockSeconds, textMeasurer, d, geometry, calibration, stopwatchNow, outgoingNow),
                     withBubble(displayedMode, bubble),
-                    stopwatchNow
+                    stopwatchNow, outgoingNow
                 )
                 val rect = shownPlan.main
                 val cardContent = displayedMode.isCard()
@@ -1214,21 +1232,16 @@ private fun CardFrame(content: @Composable () -> Unit) {
 private fun CompactCallContent(live: IslandLive?, mockTime: String) {
     val now = rememberNow()
     val mockOutgoing by IslandController.mockOutgoing.collectAsState()
-    val look by IslandController.look.collectAsState()
     val outgoing = if (live == null) mockOutgoing else live.outgoing
-    val right = when {
-        live == null -> if (mockOutgoing) firstTwoWords(MOCK_OUTGOING_NAME) else mockTime
-        else -> callPillText(live, 0, false, now)
+    if (outgoing) {
+        val name = if (live == null) MOCK_OUTGOING_NAME else live.title.ifBlank { live.text.ifBlank { "Calling" } }
+        OutgoingPillContent(name)
+        return
     }
-    val glow = outgoing && look.outgoingGlow
-    val amount = look.outgoingGlowAmount.coerceIn(0f, 1f)
-    if (glow) OutgoingGlow(amount)
+    val right = if (live == null) mockTime else callPillText(live, 0, false, now)
     PillSides(
         left = {
-            Icon(
-                Icons.Rounded.Call, null, tint = IslandSpec.CallGreen,
-                modifier = Modifier.size(pillIconDp(18f)).then(if (glow) Modifier.outgoingRings(amount) else Modifier)
-            )
+            Icon(Icons.Rounded.Call, null, tint = IslandSpec.CallGreen, modifier = Modifier.size(pillIconDp(18f)))
         },
         right = {
             Text(
@@ -1245,82 +1258,157 @@ private fun CompactCallContent(live: IslandLive?, mockTime: String) {
     )
 }
 
+private const val RINGING_TEXT = "Ringing"
+private const val OUTGOING_ICON_GAP_DP = 6f
+
 /**
- * Outgoing call (ringing on the other side): a calm green light that breathes along the pill's edge
- * (ease-in-out, ~1.8 s) plus a soft band of light that sweeps across it (~2.4 s). Draw-only: no
- * layout work per frame. Deliberately unlike the incoming pill (left-side flash + wiggling icon).
+ * Name shown right of the camera on the outgoing pill: the first two words when they fit at [style] in
+ * [maxPx], else the first word (ellipsized by the Text when even that doesn't fit). A number stays whole.
  */
-@Composable
-private fun OutgoingGlow(amount: Float) {
-    val t = rememberInfiniteTransition(label = "outgoing")
-    val breath by t.animateFloat(
-        initialValue = 0f, targetValue = 1f,
-        animationSpec = infiniteRepeatable(tween(1800, easing = FastOutSlowInEasing), RepeatMode.Reverse),
-        label = "breath"
-    )
-    val sweep by t.animateFloat(
-        initialValue = -0.35f, targetValue = 1.35f,
-        animationSpec = infiniteRepeatable(tween(2400, easing = CubicBezierEasing(0.45f, 0f, 0.25f, 1f)), RepeatMode.Restart),
-        label = "sweep"
-    )
-    Canvas(Modifier.fillMaxSize()) {
-        val r = size.height / 2f
-        val sw = (1.4f + 0.8f * breath) * density
-        val a = amount * (0.28f + 0.42f * breath)
-        val green = IslandSpec.CallGreen
-        // Edge light, brightest at the ends, a little dimmer by the camera.
-        drawRoundRect(
-            brush = Brush.horizontalGradient(listOf(green.copy(alpha = a), green.copy(alpha = a * 0.35f), green.copy(alpha = a))),
-            topLeft = Offset(sw / 2f, sw / 2f),
-            size = Size(size.width - sw, size.height - sw),
-            cornerRadius = CornerRadius(r - sw / 2f),
-            style = Stroke(width = sw)
-        )
-        // Inner soft glow hugging the edge.
-        drawRoundRect(
-            brush = Brush.verticalGradient(
-                listOf(green.copy(alpha = a * 0.22f), Color.Transparent, green.copy(alpha = a * 0.22f))
-            ),
-            cornerRadius = CornerRadius(r)
-        )
-        // Light sweep.
-        val cx = size.width * sweep
-        val bw = size.width * 0.32f
-        drawRoundRect(
-            brush = Brush.horizontalGradient(
-                listOf(
-                    Color.Transparent,
-                    green.copy(alpha = amount * 0.14f),
-                    Color.White.copy(alpha = amount * 0.10f),
-                    green.copy(alpha = amount * 0.14f),
-                    Color.Transparent
-                ),
-                startX = cx - bw / 2f, endX = cx + bw / 2f
-            ),
-            cornerRadius = CornerRadius(r)
-        )
-    }
+private fun outgoingName(full: String, tm: TextMeasurer, style: TextStyle, maxPx: Int): String {
+    val t = full.trim()
+    if (t.isEmpty() || looksLikeNumber(t)) return t
+    val words = t.split(Regex("\\s+")).filter { it.isNotEmpty() }
+    if (words.size <= 1) return t
+    val two = words[0] + " " + words[1]
+    val w = tm.measure(two, style, softWrap = false, maxLines = 1).size.width
+    return if (w <= maxPx) two else words[0]
 }
 
-/** Two soft rings that keep leaving the phone icon while the other side rings (outgoing call). */
+/**
+ * Outgoing call, the other side is ringing. Left of the camera: phone icon + "Ringing"; right: the name.
+ * The pill keeps one fixed width; nothing is drawn outside it and there is no coloured frame.
+ * Style 0 "Shimmer + wiggle": the handset wiggles like a ringing phone, a soft light glides through the
+ * letters of "Ringing". Style 1 "Sonar inside": faint green waves leave the phone icon inside the pill only,
+ * fading out before the camera / name. Draw-phase animation only (no relayout per frame).
+ */
 @Composable
-private fun Modifier.outgoingRings(amount: Float): Modifier {
-    val t = rememberInfiniteTransition(label = "rings")
-    val p by t.animateFloat(
-        initialValue = 0f, targetValue = 1f,
-        animationSpec = infiniteRepeatable(tween(1800, easing = LinearEasing), RepeatMode.Restart),
-        label = "ringsP"
-    )
-    return this.drawBehind {
-        for (i in 0..1) {
-            val q = (p + i * 0.5f) % 1f
-            val e = 1f - (1f - q) * (1f - q) // ease-out
-            drawCircle(
-                color = IslandSpec.CallGreen.copy(alpha = amount * 0.5f * (1f - q)),
-                radius = size.minDimension / 2f * (0.9f + 0.75f * e),
-                style = Stroke(width = 1.2f * density)
-            )
+private fun OutgoingPillContent(name: String) {
+    val look by IslandController.look.collectAsState()
+    val amount = look.outgoingAmount.coerceIn(0f, 1f)
+    val style = look.outgoingStyle
+    val clock = rememberFrameClock(true)
+    val textSize = pillTextSp(13f)
+    val iconSize = pillIconDp(18f)
+    val frame = LocalPillFrame.current
+    val tm = rememberTextMeasurer()
+    Box(Modifier.fillMaxSize()) {
+        if (style == 1 && amount > 0f) {
+            // Sonar: rings centred on the phone icon, clipped to the pill, gone before the camera gap.
+            Canvas(Modifier.fillMaxSize().clip(RoundedCornerShape(percent = 50))) {
+                val pad = frame?.padPx ?: (12f * density)
+                val cam = frame?.camLocalPx ?: (size.width / 2f)
+                val gap = frame?.gapPx ?: (30f * density)
+                val iconPx = iconSize.toPx()
+                val c = Offset(pad + iconPx / 2f, size.height / 2f)
+                val reach = (cam - gap / 2f - c.x).coerceAtLeast(iconPx)
+                val t = clock.value
+                val period = 1600f
+                for (i in 0..1) {
+                    val q = ((t % period.toLong()) / period + i * 0.5f) % 1f
+                    val e = 1f - (1f - q) * (1f - q) * (1f - q) // ease-out cubic
+                    val radius = iconPx * 0.55f + (reach - iconPx * 0.55f) * e
+                    val fade = (1f - q) * (1f - q)
+                    val a = (0.25f * amount * fade).coerceIn(0f, 0.25f)
+                    if (a < 0.003f) continue
+                    // Soft ring: a radial gradient band instead of a hard stroke.
+                    val band = 7f * density
+                    drawCircle(
+                        brush = Brush.radialGradient(
+                            0f to Color.Transparent,
+                            ((radius - band) / (radius + band)).coerceIn(0f, 1f) to Color.Transparent,
+                            (radius / (radius + band)).coerceIn(0f, 1f) to IslandSpec.CallGreen.copy(alpha = a),
+                            1f to Color.Transparent,
+                            center = c,
+                            radius = radius + band
+                        ),
+                        radius = radius + band,
+                        center = c
+                    )
+                }
+            }
         }
+        PillSides(
+            left = {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        Icons.Rounded.Call, null, tint = IslandSpec.CallGreen,
+                        modifier = Modifier
+                            .size(iconSize)
+                            .graphicsLayer {
+                                if (style == 0 && amount > 0f) {
+                                    // Ringing handset: ~4 quick shakes in 0.5 s, then rest ~1 s.
+                                    val p = (clock.value % 1500L).toFloat()
+                                    rotationZ = if (p < 500f) {
+                                        val k = p / 500f
+                                        val env = sin(PI.toFloat() * k) // ease in & out of the shake
+                                        (6f + 6f * amount) * env * sin(2f * PI.toFloat() * 4f * k)
+                                    } else 0f
+                                    transformOrigin = TransformOrigin(0.5f, 0.6f)
+                                }
+                            }
+                    )
+                    Spacer(Modifier.width(OUTGOING_ICON_GAP_DP.dp))
+                    if (style == 0 && amount > 0f) {
+                        val ringStyle = TextStyle(fontSize = textSize, fontWeight = FontWeight.SemiBold)
+                        Text(
+                            text = RINGING_TEXT,
+                            color = Color.White,
+                            maxLines = 1,
+                            softWrap = false,
+                            style = ringStyle,
+                            modifier = Modifier
+                                .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
+                                .drawWithContent {
+                                    drawContent()
+                                    // Light glides through the letters (~2 s a pass): dim the text, brighten a soft band.
+                                    val p = (clock.value % 2000L) / 2000f
+                                    val e = p * p * (3f - 2f * p) // smoothstep
+                                    val w = size.width
+                                    val band = w * 0.55f
+                                    val x = -band + (w + 2f * band) * e
+                                    val dim = 1f - 0.38f * amount
+                                    drawRect(
+                                        brush = Brush.horizontalGradient(
+                                            0f to Color.White.copy(alpha = dim),
+                                            0.5f to Color.White,
+                                            1f to Color.White.copy(alpha = dim),
+                                            startX = x - band / 2f,
+                                            endX = x + band / 2f,
+                                            tileMode = TileMode.Clamp
+                                        ),
+                                        blendMode = BlendMode.DstIn
+                                    )
+                                }
+                        )
+                    } else {
+                        Text(
+                            text = RINGING_TEXT,
+                            color = IslandSpec.TextPrimary,
+                            fontSize = textSize,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 1,
+                            softWrap = false
+                        )
+                    }
+                }
+            },
+            right = {
+                BoxWithConstraints(contentAlignment = Alignment.CenterEnd) {
+                    val nameStyle = TextStyle(fontSize = textSize, fontWeight = FontWeight.SemiBold)
+                    val maxPx = constraints.maxWidth
+                    val shown = remember(name, maxPx, textSize) { outgoingName(name, tm, nameStyle, maxPx) }
+                    Text(
+                        text = shown,
+                        color = IslandSpec.TextPrimary,
+                        style = nameStyle,
+                        maxLines = 1,
+                        softWrap = false,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+        )
     }
 }
 

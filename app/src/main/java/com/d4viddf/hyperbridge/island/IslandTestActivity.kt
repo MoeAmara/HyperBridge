@@ -684,30 +684,45 @@ private fun CallControlSection() {
 }
 
 
-/** Outgoing call pill look: glow on/off + strength (Layout-style controls). */
+/** Outgoing call pill: motion style + strength (also shown in Layout -> "Small pill — Outgoing call"). */
 @Composable
 private fun OutgoingCallSection() {
+    Text("Outgoing call pill", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+    Text(
+        "While the other side is ringing: phone icon + \"Ringing\" left of the camera, the name right of it " +
+                "(first two words, or the first word when they don't fit; the number when it isn't a saved contact). " +
+                "One fixed size for every name — set it in Layout -> Small pill — Outgoing call. When they answer " +
+                "it becomes the normal timer pill. Try it with \"Outgoing call\" above.",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant
+    )
+    OutgoingMotionControls()
+}
+
+/** Style selector ("Shimmer + wiggle" / "Sonar inside") + strength for the outgoing pill. */
+@Composable
+private fun OutgoingMotionControls() {
     val context = LocalContext.current
     val l by IslandController.look.collectAsState()
     fun set(n: IslandLook) {
         IslandController.setLook(n)
         IslandCalibrationStore.saveLook(context, n)
     }
-    Text("Outgoing call pill", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-    Text(
-        "While the other side is ringing, the call pill shows the person's name (first two words; the number when " +
-                "it isn't a saved contact) with a soft breathing glow, a light sweep and rings from the phone icon. " +
-                "When they answer it becomes the normal timer pill. Try it with \"Outgoing call\" above.",
-        style = MaterialTheme.typography.bodySmall,
-        color = MaterialTheme.colorScheme.onSurfaceVariant
-    )
-    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-        Text("Glow animation", modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
-        Switch(checked = l.outgoingGlow, onCheckedChange = { set(l.copy(outgoingGlow = it)) })
+    Text("Motion style", style = MaterialTheme.typography.bodyMedium)
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        listOf("Shimmer + wiggle", "Sonar inside").forEachIndexed { i, label ->
+            if (l.outgoingStyle == i) {
+                Button(onClick = { set(l.copy(outgoingStyle = i)) }, modifier = Modifier.weight(1f)) { Text(label) }
+            } else {
+                OutlinedButton(onClick = { set(l.copy(outgoingStyle = i)) }, modifier = Modifier.weight(1f)) { Text(label) }
+            }
+        }
     }
-    if (l.outgoingGlow) {
-        CalRow("Glow strength", l.outgoingGlowAmount * 100f, 10f, 100f, 5f, "%") { set(l.copy(outgoingGlowAmount = it / 100f)) }
-    }
+    CalRow("Motion strength", l.outgoingAmount * 100f, 0f, 100f, 5f, "%") { set(l.copy(outgoingAmount = it / 100f)) }
+    OutlinedButton(
+        onClick = { IslandController.show(IslandMode.COMPACT, outgoing = true) },
+        modifier = Modifier.fillMaxWidth()
+    ) { Text("Preview outgoing call") }
 }
 
 /**
@@ -939,6 +954,7 @@ private fun pillPreviewMode(t: PillType): IslandMode = when (t) {
     PillType.TIMER, PillType.STOPWATCH -> IslandMode.TIMER_PILL
     PillType.RECORDER -> IslandMode.REC_PILL
     PillType.INCOMING -> IslandMode.INCOMING_PILL
+    PillType.OUTGOING -> IslandMode.COMPACT
 }
 
 private fun cardPreviewMode(t: CardType): IslandMode = when (t) {
@@ -954,9 +970,10 @@ private fun previewSection(s: LayoutSection) {
         is LayoutSection.Pill -> {
             val m = pillPreviewMode(s.type)
             val sw = s.type == PillType.STOPWATCH
+            val og = s.type == PillType.OUTGOING
             if (IslandController.mode.value != m || IslandController.mockStopwatch.value != sw ||
-                IslandController.bubble.value != null
-            ) IslandController.show(m, sw)
+                IslandController.mockOutgoing.value != og || IslandController.bubble.value != null
+            ) IslandController.show(m, sw, og)
         }
         is LayoutSection.Card -> {
             val m = cardPreviewMode(s.type)
@@ -1138,7 +1155,7 @@ private fun PillEditor(
     if (t == PillType.MUSIC) {
         CalRow("Sound-wave height", res.textSp, 6f, 30f, 0.5f, "dp") { set(cur.copy(textSp = it)) }
     } else {
-        CalRow(if (t == PillType.INCOMING) "Text size" else "Number size", res.textSp, 8f, 26f, 0.5f, "sp") {
+        CalRow(if (t.isLong) "Text size" else "Number size", res.textSp, 8f, 26f, 0.5f, "sp") {
             set(cur.copy(textSp = it))
         }
     }
@@ -1151,7 +1168,8 @@ private fun PillEditor(
             Text("Reset")
         }
     }
-    if (t != PillType.INCOMING) {
+    if (t == PillType.OUTGOING) OutgoingMotionControls()
+    if (!t.isLong) {
         OutlinedButton(
             onClick = {
                 // Copies this pill's shape (width, height, corners, padding, offset) to the other small pills;
@@ -1160,7 +1178,7 @@ private fun PillEditor(
                 val radius = if (fullyRound) -1f else r.radiusPx / density
                 val next = c.pills.toMutableMap()
                 for (o in PillType.entries) {
-                    if (o == PillType.INCOMING) continue
+                    if (o.isLong) continue
                     val od = next[o] ?: PillDims()
                     next[o] = od.copy(
                         widthDp = r.widthPx / density,

@@ -130,7 +130,12 @@ data class IslandCalibration(
 
 /** The small pills that can be sized separately. */
 enum class PillType(val label: String) {
-    MUSIC("Music"), CALL("Call"), TIMER("Timer"), STOPWATCH("Stopwatch"), RECORDER("Recorder"), INCOMING("Incoming call");
+    MUSIC("Music"), CALL("Call"), TIMER("Timer"), STOPWATCH("Stopwatch"), RECORDER("Recorder"), INCOMING("Incoming call"),
+    /** Outgoing call while the other side rings: phone + "Ringing" left of the camera, the name right. Fixed width. */
+    OUTGOING("Outgoing call");
+
+    /** Long pills with their own fixed width (not part of "Copy to all"). */
+    val isLong: Boolean get() = this == INCOMING || this == OUTGOING
 
     /** Default icon size (dp): icon / album art / waveform height. */
     val defaultIconDp: Float
@@ -146,6 +151,7 @@ enum class PillType(val label: String) {
         get() = when (this) {
             MUSIC -> 14f
             INCOMING -> 12.5f
+            OUTGOING -> 13f
             else -> 15f
         }
 }
@@ -192,10 +198,10 @@ data class IslandLook(
     val bubbleGlow: Boolean = true,
     /** Blur follows the card per frame by moving its view (smooth); false = resize the window (fallback). */
     val blurFollowView: Boolean = true,
-    /** Outgoing call pill (ringing on the other side): soft breathing glow + light sweep + rings. */
-    val outgoingGlow: Boolean = true,
-    /** Strength of that glow, 0..1. */
-    val outgoingGlowAmount: Float = 0.7f
+    /** Outgoing call pill motion: 0 = "Shimmer + wiggle", 1 = "Sonar inside". Everything stays inside the pill. */
+    val outgoingStyle: Int = 0,
+    /** Strength of the active outgoing motion style, 0..1. */
+    val outgoingAmount: Float = 0.7f
 )
 
 /**
@@ -333,9 +339,9 @@ object IslandLayout {
     fun incomingWidthPx(g: IslandGeometry, c: IslandCalibration, density: Float): Float =
         if (c.incomingWidthDp > 0f) c.incomingWidthDp * density else autoIncomingWidthPx(g, c, density)
 
-    /** Which small pill type a mode shows ([stopwatch] splits the timer pill). */
-    fun pillTypeOf(mode: IslandMode, stopwatch: Boolean): PillType? = when (mode.compact()) {
-        IslandMode.COMPACT -> PillType.CALL
+    /** Which small pill type a mode shows ([stopwatch] splits the timer pill, [outgoing] the call pill). */
+    fun pillTypeOf(mode: IslandMode, stopwatch: Boolean, outgoing: Boolean = false): PillType? = when (mode.compact()) {
+        IslandMode.COMPACT -> if (outgoing && mode == IslandMode.COMPACT) PillType.OUTGOING else PillType.CALL
         IslandMode.COMPACT_MUSIC -> PillType.MUSIC
         IslandMode.INCOMING_PILL -> PillType.INCOMING
         IslandMode.TIMER_PILL -> if (stopwatch) PillType.STOPWATCH else PillType.TIMER
@@ -367,7 +373,11 @@ object IslandLayout {
     fun pillResolved(t: PillType, g: IslandGeometry, c: IslandCalibration, density: Float): PillResolved {
         val p = c.pill(t)
         val h = if (p.heightDp > 0f) p.heightDp * density else pillHeightPx(g, c, density)
-        val baseW = if (t == PillType.INCOMING) incomingWidthPx(g, c, density) else compactWidthPx(g, c, density)
+        val baseW = when (t) {
+            PillType.INCOMING -> incomingWidthPx(g, c, density)
+            PillType.OUTGOING -> wideWidthPx(g, c, density)
+            else -> compactWidthPx(g, c, density)
+        }
         val w = if (p.widthDp > 0f) p.widthDp * density else baseW
         val rDp = if (p.radiusDp > -1.5f) p.radiusDp else c.radiusDp
         val r = if (rDp >= 0f) min(rDp * density, h / 2f) else h / 2f
@@ -420,15 +430,16 @@ object IslandLayout {
         density: Float,
         slots: PillSlots?,
         withBubble: Boolean,
-        stopwatch: Boolean = false
+        stopwatch: Boolean = false,
+        outgoing: Boolean = false
     ): IslandPlan {
         if (mode == IslandMode.HIDDEN) return IslandPlan(camera(g, c, density), null, null)
         if (mode.isCard()) {
             val ct = cardTypeOf(mode, stopwatch) ?: CardType.CALL
-            val bubble = if (withBubble) plan(mode.compact(), g, c, density, slots, true, stopwatch).bubble else null
+            val bubble = if (withBubble) plan(mode.compact(), g, c, density, slots, true, stopwatch, outgoing).bubble else null
             return IslandPlan(cardRect(ct, g, c, density), null, bubble)
         }
-        val type = pillTypeOf(mode, stopwatch)
+        val type = pillTypeOf(mode, stopwatch, outgoing)
         val res = type?.let { pillResolved(it, g, c, density) }
         val h = res?.heightPx ?: pillHeightPx(g, c, density)
         val r = res?.radiusPx ?: radius(h, c, density)
@@ -452,6 +463,27 @@ object IslandLayout {
         val bubble = withBubble && mode != IslandMode.WIDE
 
         fun frame(w: Float, camLocal: Float, right: Boolean) = PillFrame(w, camLocal, pad, gap, right, iconDp, textSp)
+
+        if (type == PillType.OUTGOING) {
+            // One fixed width for every name (the name is shortened instead); only "Ringing" must fit on the left.
+            val fw = (if (res?.widthSet == true) base else max(base, 2f * (pad + l) + gap)).coerceAtMost(maxW)
+            if (!bubble) {
+                val cx = camX + shift
+                return IslandPlan(IslandRectPx(cx, top, fw, h, r), frame(fw, fw / 2f - shift, false), null)
+            }
+            val b = bubbleSizePx(g, c, density)
+            val bGap = c.bubbleGapDp.coerceIn(0f, 40f) * density
+            val right = c.bubbleRight
+            val off = c.groupOffsetXPx + shift
+            val groupLeft = camX + off - (b + bGap + fw) / 2f
+            val pillLeft = if (right) groupLeft else groupLeft + b + bGap
+            val bubCx = if (right) groupLeft + fw + bGap + b / 2f else groupLeft + b / 2f
+            return IslandPlan(
+                IslandRectPx(pillLeft + fw / 2f, top, fw, h, r),
+                frame(fw, camX - pillLeft, false),
+                IslandRectPx(bubCx, camY - b / 2f, b, b, b / 2f)
+            )
+        }
 
         if (!bubble) {
             val w = when {
@@ -625,8 +657,8 @@ object IslandCalibrationStore {
             solid = p.getBoolean("look.solid", d.solid),
             bubbleGlow = p.getBoolean("look.bubbleGlow", d.bubbleGlow),
             blurFollowView = p.getBoolean("look.blurFollowView", d.blurFollowView),
-            outgoingGlow = p.getBoolean("look.outgoingGlow", d.outgoingGlow),
-            outgoingGlowAmount = p.getFloat("look.outgoingGlowAmount", d.outgoingGlowAmount)
+            outgoingStyle = p.getInt("look.outgoingStyle", d.outgoingStyle).coerceIn(0, 1),
+            outgoingAmount = p.getFloat("look.outgoingAmount", d.outgoingAmount)
         )
     }
 
@@ -637,8 +669,8 @@ object IslandCalibrationStore {
             .putBoolean("look.solid", l.solid)
             .putBoolean("look.bubbleGlow", l.bubbleGlow)
             .putBoolean("look.blurFollowView", l.blurFollowView)
-            .putBoolean("look.outgoingGlow", l.outgoingGlow)
-            .putFloat("look.outgoingGlowAmount", l.outgoingGlowAmount)
+            .putInt("look.outgoingStyle", l.outgoingStyle)
+            .putFloat("look.outgoingAmount", l.outgoingAmount)
             .apply()
     }
 
@@ -680,7 +712,7 @@ object IslandCalibrationStore {
         o.put("look", org.json.JSONObject().apply {
             put("blurDp", l.blurDp.toDouble()); put("tint", l.tint.toDouble()); put("solid", l.solid)
             put("bubbleGlow", l.bubbleGlow); put("blurFollowView", l.blurFollowView)
-            put("outgoingGlow", l.outgoingGlow); put("outgoingGlowAmount", l.outgoingGlowAmount.toDouble())
+            put("outgoingStyle", l.outgoingStyle); put("outgoingAmount", l.outgoingAmount.toDouble())
         })
         return o.toString(2)
     }
@@ -724,7 +756,7 @@ object IslandCalibrationStore {
         val l = if (lj == null) l0 else IslandLook(
             lj.f("blurDp", l0.blurDp), lj.f("tint", l0.tint), lj.optBoolean("solid", l0.solid),
             lj.optBoolean("bubbleGlow", l0.bubbleGlow), lj.optBoolean("blurFollowView", l0.blurFollowView),
-            lj.optBoolean("outgoingGlow", l0.outgoingGlow), lj.f("outgoingGlowAmount", l0.outgoingGlowAmount)
+            lj.optInt("outgoingStyle", l0.outgoingStyle).coerceIn(0, 1), lj.f("outgoingAmount", l0.outgoingAmount)
         )
         return Triple(c, m, l)
     }
@@ -901,7 +933,7 @@ object IslandController {
     /** Island Test / Layout screen: the mock timer pill / card is a stopwatch. */
     private val _mockStopwatch = MutableStateFlow(false)
 
-    /** Island Test: the mock call pill is an outgoing call (name + glow instead of the timer). */
+    /** Island Test: the mock call pill is an outgoing call (phone + "Ringing" + name instead of the timer). */
     private val _mockOutgoing = MutableStateFlow(false)
     val mockOutgoing: StateFlow<Boolean> = _mockOutgoing.asStateFlow()
 
