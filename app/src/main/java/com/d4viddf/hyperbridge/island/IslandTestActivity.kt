@@ -5,7 +5,10 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import android.provider.Settings
+import android.content.ClipData
+import android.content.ClipboardManager
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -33,6 +36,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -58,6 +62,7 @@ class IslandTestActivity : ComponentActivity() {
         IslandController.setCalibration(IslandCalibrationStore.load(this))
         IslandController.setMotion(IslandCalibrationStore.loadMotion(this))
         IslandController.setIconHide(IslandCalibrationStore.loadIconHide(this))
+        IslandController.setLook(IslandCalibrationStore.loadLook(this))
         enableEdgeToEdge()
         setContent {
             HyperBridgeTheme {
@@ -124,6 +129,12 @@ private fun IslandTestScreen(
     val mode by IslandController.mode.collectAsState()
     val geometry by IslandController.geometry.collectAsState()
     val calibration by IslandController.calibration.collectAsState()
+    var showLayout by remember { mutableStateOf(false) }
+
+    if (showLayout) {
+        LayoutScreen(geometry, calibration, onCalibrationChange) { showLayout = false }
+        return
+    }
 
     Column(
         modifier = Modifier
@@ -175,26 +186,32 @@ private fun IslandTestScreen(
                 IslandController.showTwo(IslandMode.COMPACT, BubbleKind.RECORDER)
             }
         }
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            StateButton("Stopwatch", Modifier.weight(1f)) { IslandController.show(IslandMode.TIMER_PILL, stopwatch = true) }
+            StateButton("Two at once (Stopwatch + Call)", Modifier.weight(1f)) {
+                IslandController.showTwo(IslandMode.TIMER_PILL, BubbleKind.CALL, stopwatch = true)
+            }
+        }
         OutlinedButton(
             onClick = { IslandController.show(IslandMode.HIDDEN) },
             modifier = Modifier.fillMaxWidth()
         ) { Text("Hide") }
-        val blur by IslandController.blurState.collectAsState()
-        Text(
-            "Blur: ${blur.label}",
-            style = MaterialTheme.typography.bodySmall,
-            fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
-            color = if (blur.real) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
-        )
+        Button(onClick = { showLayout = true }, modifier = Modifier.fillMaxWidth()) {
+            Text("Layout — sizes per type, bubble side, export / import")
+        }
         Text(
             "Swipe left/right: a card shrinks to its pill, a pill hides into the camera. " +
                     "After a swipe-hide, swipe left/right on the camera to bring it back. " +
                     "Tap a pill to expand it; touch anywhere else to collapse a card. Incoming pill: tap opens the " +
-                    "phone's call screen. Two at once: tap the bubble to swap, long-press opens its app, " +
+                    "phone's call screen. Two at once: tap the bubble to swap (with a card open, the bubble opens " +
+                    "into its own card and the card shrinks into the bubble), long-press opens its app, " +
                     "swipe on the bubble hides only the bubble.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
+
+        Spacer(Modifier.height(12.dp))
+        CardLookSection()
 
         Spacer(Modifier.height(12.dp))
         MotionSection()
@@ -288,8 +305,8 @@ private fun CalibrationSection(
         return
     }
     Text(
-        "Changes apply live and are saved. Expanded and Music cards keep their size; " +
-                "only the horizontal offset moves them.",
+        "Global values, applied live and saved. Each content type can override them in Layout " +
+                "(button above) — incoming pill width, card sizes, bubble size / gap / side live there now.",
         style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant
     )
@@ -324,10 +341,6 @@ private fun CalibrationSection(
     CalRow("Pill inner padding", c.pillPadDp, 4f, 24f, 0.5f, "dp") {
         onChange(c.copy(pillPadDp = it), if (currentMode.isCard() || currentMode == IslandMode.HIDDEN) IslandMode.REC_PILL else null)
     }
-    val incomingDp = IslandLayout.incomingWidthPx(geometry, c, density) / density
-    CalRow("Incoming pill width", incomingDp, 100f, 380f, 0.5f, "dp") {
-        onChange(c.copy(incomingWidthDp = it), IslandMode.INCOMING_PILL)
-    }
     CalRow(
         label = if (c.radiusDp < 0f) "Corner radius (fully rounded)" else "Corner radius",
         value = radiusDp,
@@ -344,14 +357,14 @@ private fun CalibrationSection(
             modifier = Modifier.weight(1f)
         ) { Text("Fully rounded") }
         OutlinedButton(
-            onClick = { onChange(IslandCalibration(), pillPreview) },
+            onClick = { onChange(IslandCalibration(pills = c.pills, cards = c.cards, bubbleRight = c.bubbleRight), pillPreview) },
             modifier = Modifier.weight(1f)
         ) { Text("Reset to auto") }
     }
 
     // ---- Two activities (bubble) ----
     Spacer(Modifier.height(8.dp))
-    Text("Two at once (bubble)", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
+    Text("Two at once (counter)", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
     Text(
         "Changes preview with \"Two at once (Timer + Music)\" if no bubble is showing.",
         style = MaterialTheme.typography.bodySmall,
@@ -362,10 +375,6 @@ private fun CalibrationSection(
         onChange(next, null)
         if (!bubbleUp) IslandController.showTwo(IslandMode.TIMER_PILL, BubbleKind.MUSIC)
     }
-    val bubbleDp = IslandLayout.bubbleSizePx(geometry, c, density) / density
-    CalRow("Bubble size", bubbleDp, 16f, 64f, 0.5f, "dp") { preview(c.copy(bubbleSizeDp = it)) }
-    CalRow("Bubble gap", c.bubbleGapDp, 0f, 24f, 0.5f, "dp") { preview(c.copy(bubbleGapDp = it)) }
-    CalRow("Group horizontal offset", c.groupOffsetXPx, -120f, 120f, 1f, "px") { preview(c.copy(groupOffsetXPx = it)) }
     CalRow("Counter shift (auto + manual)", c.counterShiftPx, -80f, 80f, 1f, "px") { preview(c.copy(counterShiftPx = it)) }
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
         Text("Counter right of camera", modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
@@ -376,13 +385,12 @@ private fun CalibrationSection(
             val d = IslandCalibration()
             preview(
                 c.copy(
-                    bubbleSizeDp = d.bubbleSizeDp, bubbleGapDp = d.bubbleGapDp, groupOffsetXPx = d.groupOffsetXPx,
                     counterShiftPx = d.counterShiftPx, counterRight = d.counterRight
                 )
             )
         },
         modifier = Modifier.fillMaxWidth()
-    ) { Text("Reset bubble") }
+    ) { Text("Reset counter") }
 }
 
 @Composable
@@ -555,7 +563,8 @@ private fun IconHideSection() {
     Text(
         "Optional, off by default. While the island shows a content whose switch is on, the notification icons " +
                 "next to the clock are hidden via Shizuku and come back when it ends. The notifications themselves stay. " +
-                "Mock buttons above (Compact / Incoming / Timer / Recorder) count too.",
+                "Mock buttons above (Compact / Incoming / Timer / Recorder / Two at once) count too. " +
+                "\"Two activities at once\" hides them whenever a second content shows as the bubble, any type.",
         style = MaterialTheme.typography.bodySmall,
         color = if (granted) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.error
     )
@@ -567,6 +576,7 @@ private fun IconHideSection() {
     IconSwitchRow("Call", prefs.call, granted) { set(prefs.copy(call = it)) }
     IconSwitchRow("Timer & Stopwatch", prefs.timer, granted) { set(prefs.copy(timer = it)) }
     IconSwitchRow("Recorder", prefs.recorder, granted) { set(prefs.copy(recorder = it)) }
+    IconSwitchRow("Two activities at once", prefs.multi, granted) { set(prefs.copy(multi = it)) }
     val scope = rememberCoroutineScope()
     var testing by remember { mutableStateOf(false) }
     OutlinedButton(
@@ -711,4 +721,381 @@ private fun LiveSection() {
     if (dump.isNotEmpty()) {
         Text(dump, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
+}
+
+// ---- Layout screen (Phase 4.1): sizes per content type ----------------------------------------
+
+/** One editable group on the Layout screen and the mock it previews on the real island. */
+private sealed class LayoutSection(val key: String, val title: String) {
+    class Pill(val type: PillType) : LayoutSection("pill." + type.name, "Small pill — " + type.label)
+    class Card(val type: CardType) : LayoutSection("card." + type.name, "Expanded card — " + type.label)
+    object Bubble : LayoutSection("bubble", "Bubble (two at once)")
+}
+
+private val LAYOUT_SECTIONS: List<LayoutSection> =
+    PillType.entries.map { LayoutSection.Pill(it) } + LayoutSection.Bubble + CardType.entries.map { LayoutSection.Card(it) }
+
+private fun pillPreviewMode(t: PillType): IslandMode = when (t) {
+    PillType.MUSIC -> IslandMode.COMPACT_MUSIC
+    PillType.CALL -> IslandMode.COMPACT
+    PillType.TIMER, PillType.STOPWATCH -> IslandMode.TIMER_PILL
+    PillType.RECORDER -> IslandMode.REC_PILL
+    PillType.INCOMING -> IslandMode.INCOMING_PILL
+}
+
+private fun cardPreviewMode(t: CardType): IslandMode = when (t) {
+    CardType.MUSIC -> IslandMode.MUSIC
+    CardType.CALL -> IslandMode.EXPANDED
+    CardType.TIMER, CardType.STOPWATCH -> IslandMode.TIMER_CARD
+    CardType.RECORDER -> IslandMode.REC_CARD
+}
+
+/** Shows the mock of [s] on the real island (only when it isn't already up, so edits don't replay it). */
+private fun previewSection(s: LayoutSection) {
+    when (s) {
+        is LayoutSection.Pill -> {
+            val m = pillPreviewMode(s.type)
+            val sw = s.type == PillType.STOPWATCH
+            if (IslandController.mode.value != m || IslandController.mockStopwatch.value != sw ||
+                IslandController.bubble.value != null
+            ) IslandController.show(m, sw)
+        }
+        is LayoutSection.Card -> {
+            val m = cardPreviewMode(s.type)
+            val sw = s.type == CardType.STOPWATCH
+            if (IslandController.mode.value != m || IslandController.mockStopwatch.value != sw ||
+                IslandController.bubble.value != null
+            ) IslandController.show(m, sw)
+        }
+        LayoutSection.Bubble -> {
+            if (IslandController.bubble.value == null || IslandController.mode.value != IslandMode.TIMER_PILL) {
+                IslandController.showTwo(IslandMode.TIMER_PILL, BubbleKind.MUSIC)
+            }
+        }
+    }
+}
+
+@Composable
+private fun LayoutScreen(
+    geometry: IslandGeometry?,
+    calibration: IslandCalibration,
+    onCalibrationChange: (IslandCalibration, IslandMode?) -> Unit,
+    onBack: () -> Unit
+) {
+    val context = LocalContext.current
+    val density = LocalDensity.current.density
+    var focused by remember { mutableStateOf<String?>(null) }
+    var importStatus by remember { mutableStateOf("") }
+    BackHandler { onBack() }
+    DisposableEffect(Unit) {
+        IslandController.setLayoutPreview(true)
+        onDispose {
+            IslandController.setLayoutPreview(false)
+            IslandController.show(IslandMode.HIDDEN)
+        }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .safeDrawingPadding()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 20.dp, vertical = 24.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        Spacer(Modifier.height(140.dp)) // keep the controls clear of the island (and of tall cards)
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            OutlinedButton(onClick = onBack) { Text("← Back") }
+            Spacer(Modifier.size(12.dp))
+            Text("Layout", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
+        }
+        Text(
+            "Sizes per content type. Open a section: the real island shows that content on the camera while " +
+                    "you edit, and hides when you close it or leave this screen. Everything is saved and applied " +
+                    "live. If a time gets longer than the width you set (e.g. 1:00:00), the pill widens just " +
+                    "enough and keeps its padding.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        if (geometry == null) {
+            Text(
+                "Turn the island service on first.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.error
+            )
+            return@Column
+        }
+
+        for (s in LAYOUT_SECTIONS) {
+            val open = focused == s.key
+            Surface(
+                tonalElevation = if (open) 3.dp else 1.dp,
+                shape = MaterialTheme.shapes.medium,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            s.title,
+                            modifier = Modifier.weight(1f),
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.Bold
+                        )
+                        OutlinedButton(onClick = {
+                            if (open) {
+                                focused = null
+                                IslandController.show(IslandMode.HIDDEN)
+                            } else {
+                                focused = s.key
+                                previewSection(s)
+                            }
+                        }) { Text(if (open) "Close" else "Edit") }
+                    }
+                    if (open) {
+                        fun change(next: IslandCalibration) {
+                            onCalibrationChange(next, null)
+                            previewSection(s)
+                        }
+                        when (s) {
+                            is LayoutSection.Pill -> PillEditor(s.type, geometry, calibration, density, ::change)
+                            is LayoutSection.Card -> CardEditor(s.type, geometry, calibration, density, ::change)
+                            LayoutSection.Bubble -> BubbleEditor(geometry, calibration, density, ::change)
+                        }
+                    }
+                }
+            }
+        }
+
+        Spacer(Modifier.height(8.dp))
+        Text("Export / Import", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+        Text(
+            "Copies every layout, calibration, animation and card-look value as JSON to the clipboard; Import " +
+                    "reads it back from the clipboard.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Button(onClick = {
+                val json = IslandCalibrationStore.exportJson(
+                    IslandController.calibration.value, IslandController.motion.value, IslandController.look.value
+                )
+                val cm = context.getSystemService(ClipboardManager::class.java)
+                cm?.setPrimaryClip(ClipData.newPlainText("HyperBridge island layout", json))
+                importStatus = "Copied (${json.length} characters)."
+            }, modifier = Modifier.weight(1f)) { Text("Export (copy)") }
+            OutlinedButton(onClick = {
+                val cm = context.getSystemService(ClipboardManager::class.java)
+                val text = cm?.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(context)?.toString()
+                importStatus = if (text.isNullOrBlank()) "Clipboard is empty." else try {
+                    val (c, m, l) = IslandCalibrationStore.importJson(
+                        text,
+                        Triple(IslandController.calibration.value, IslandController.motion.value, IslandController.look.value)
+                    )
+                    onCalibrationChange(c, null)
+                    IslandController.setMotion(m)
+                    IslandCalibrationStore.saveMotion(context, m)
+                    IslandController.setLook(l)
+                    IslandCalibrationStore.saveLook(context, l)
+                    "Imported."
+                } catch (e: Exception) {
+                    "Import failed: ${e.message ?: e.javaClass.simpleName}"
+                }
+            }, modifier = Modifier.weight(1f)) { Text("Import (paste)") }
+        }
+        if (importStatus.isNotEmpty()) {
+            Text(importStatus, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
+        }
+        Spacer(Modifier.height(240.dp)) // so the last section can scroll above tall preview cards
+    }
+}
+
+@Composable
+private fun PillEditor(
+    t: PillType,
+    g: IslandGeometry,
+    c: IslandCalibration,
+    density: Float,
+    onChange: (IslandCalibration) -> Unit
+) {
+    val res = IslandLayout.pillResolved(t, g, c, density)
+    val cur = c.pill(t)
+    fun set(d: PillDims) = onChange(c.copy(pills = c.pills + (t to d)))
+    val screenDp = g.screenWidthPx / density
+    val wDp = res.widthPx / density
+    val hDp = res.heightPx / density
+    val fullyRound = (if (cur.radiusDp > -1.5f) cur.radiusDp else c.radiusDp) < 0f
+    CalRow("Width", wDp, 40f, (screenDp * 0.9f).coerceAtLeast(120f), 0.5f, "dp") { set(cur.copy(widthDp = it)) }
+    CalRow("Height", hDp, 16f, 64f, 0.5f, "dp") { set(cur.copy(heightDp = it)) }
+    CalRow(
+        if (fullyRound) "Corner radius (fully rounded)" else "Corner radius",
+        res.radiusPx / density, 0f, 32f, 0.5f, "dp"
+    ) { set(cur.copy(radiusDp = it)) }
+    CalRow("Side padding", res.padPx / density, 0f, 30f, 0.5f, "dp") { set(cur.copy(padDp = it)) }
+    val iconLabel = when (t) {
+        PillType.MUSIC -> "Album art size"
+        PillType.RECORDER -> "Waveform height"
+        else -> "Icon size"
+    }
+    CalRow(iconLabel, res.iconDp, 8f, 40f, 0.5f, "dp") { set(cur.copy(iconDp = it)) }
+    if (t == PillType.MUSIC) {
+        CalRow("Sound-wave height", res.textSp, 6f, 30f, 0.5f, "dp") { set(cur.copy(textSp = it)) }
+    } else {
+        CalRow(if (t == PillType.INCOMING) "Text size" else "Number size", res.textSp, 8f, 26f, 0.5f, "sp") {
+            set(cur.copy(textSp = it))
+        }
+    }
+    CalRow("Horizontal offset", res.offsetXPx, -120f, 120f, 1f, "px") { set(cur.copy(offsetXPx = it)) }
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        OutlinedButton(onClick = { set(cur.copy(radiusDp = -1f)) }, modifier = Modifier.weight(1f)) {
+            Text("Fully rounded")
+        }
+        OutlinedButton(onClick = { onChange(c.copy(pills = c.pills - t)) }, modifier = Modifier.weight(1f)) {
+            Text("Reset")
+        }
+    }
+    if (t != PillType.INCOMING) {
+        OutlinedButton(
+            onClick = {
+                // Copies this pill's shape (width, height, corners, padding, offset) to the other small pills;
+                // each keeps its own icon / number size.
+                val r = IslandLayout.pillResolved(t, g, c, density)
+                val radius = if (fullyRound) -1f else r.radiusPx / density
+                val next = c.pills.toMutableMap()
+                for (o in PillType.entries) {
+                    if (o == PillType.INCOMING) continue
+                    val od = next[o] ?: PillDims()
+                    next[o] = od.copy(
+                        widthDp = r.widthPx / density,
+                        heightDp = r.heightPx / density,
+                        radiusDp = radius,
+                        padDp = r.padPx / density,
+                        offsetXPx = r.offsetXPx
+                    )
+                }
+                onChange(c.copy(pills = next))
+            },
+            modifier = Modifier.fillMaxWidth()
+        ) { Text("Copy to all small pills (shape only)") }
+    }
+}
+
+@Composable
+private fun CardEditor(
+    t: CardType,
+    g: IslandGeometry,
+    c: IslandCalibration,
+    density: Float,
+    onChange: (IslandCalibration) -> Unit
+) {
+    val rect = IslandLayout.cardRect(t, g, c, density)
+    val cur = c.card(t)
+    fun set(d: CardDims) = onChange(c.copy(cards = c.cards + (t to d)))
+    val screenDp = g.screenWidthPx / density
+    CalRow("Width", rect.w / density, 120f, screenDp, 0.5f, "dp") { set(cur.copy(widthDp = it)) }
+    CalRow("Height", rect.h / density, 40f, screenDp * IslandLayout.MAX_CARD_HEIGHT_RATIO, 0.5f, "dp") {
+        set(cur.copy(heightDp = it))
+    }
+    CalRow("Corner radius", rect.r / density, 0f, 60f, 0.5f, "dp") { set(cur.copy(radiusDp = it)) }
+    OutlinedButton(onClick = { onChange(c.copy(cards = c.cards - t)) }, modifier = Modifier.fillMaxWidth()) {
+        Text("Reset")
+    }
+}
+
+@Composable
+private fun BubbleEditor(
+    g: IslandGeometry,
+    c: IslandCalibration,
+    density: Float,
+    onChange: (IslandCalibration) -> Unit
+) {
+    val bubbleDp = IslandLayout.bubbleSizePx(g, c, density) / density
+    CalRow("Size", bubbleDp, 16f, 64f, 0.5f, "dp") { onChange(c.copy(bubbleSizeDp = it)) }
+    CalRow("Gap", c.bubbleGapDp, 0f, 24f, 0.5f, "dp") { onChange(c.copy(bubbleGapDp = it)) }
+    CalRow("Group horizontal offset", c.groupOffsetXPx, -120f, 120f, 1f, "px") { onChange(c.copy(groupOffsetXPx = it)) }
+    Text("Bubble side", style = MaterialTheme.typography.bodyMedium)
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        if (!c.bubbleRight) {
+            Button(onClick = {}, modifier = Modifier.weight(1f)) { Text("Left ✓") }
+            OutlinedButton(onClick = { onChange(c.copy(bubbleRight = true)) }, modifier = Modifier.weight(1f)) { Text("Right") }
+        } else {
+            OutlinedButton(onClick = { onChange(c.copy(bubbleRight = false)) }, modifier = Modifier.weight(1f)) { Text("Left") }
+            Button(onClick = {}, modifier = Modifier.weight(1f)) { Text("Right ✓") }
+        }
+    }
+    Text(
+        "\"Counter right of camera\" (Calibrate) still wins: with a call / timer / recorder pill the group may " +
+                "not be centred.",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant
+    )
+    OutlinedButton(
+        onClick = {
+            val d = IslandCalibration()
+            onChange(c.copy(bubbleSizeDp = d.bubbleSizeDp, bubbleGapDp = d.bubbleGapDp, groupOffsetXPx = d.groupOffsetXPx, bubbleRight = d.bubbleRight))
+        },
+        modifier = Modifier.fillMaxWidth()
+    ) { Text("Reset") }
+}
+
+// ---- Card look (Phase 4.1): blur from the first frame -----------------------------------------
+
+@Composable
+private fun CardLookSection() {
+    val context = LocalContext.current
+    val l by IslandController.look.collectAsState()
+    val blur by IslandController.blurState.collectAsState()
+    fun set(n: IslandLook) {
+        IslandController.setLook(n)
+        IslandCalibrationStore.saveLook(context, n)
+    }
+    Text("Card background", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+    val mode = when {
+        l.solid -> "solid (plain black, no blur)"
+        blur.real -> "real (" + (if (l.blurFollowView) "follows the card every frame" else "window resize fallback") + ")"
+        else -> "fallback (dark translucent — " + blur.label.removePrefix("fallback — ") + ")"
+    }
+    Text(
+        "Blur: $mode",
+        style = MaterialTheme.typography.bodySmall,
+        fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+        color = if (blur.real && !l.solid) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+    )
+    Text(
+        "The blur starts with the card on the first frame and follows its shape on the same spring. " +
+                "Tap Expanded / Music above (or Replay) to check.",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant
+    )
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Text("Solid black", modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
+        Switch(checked = l.solid, onCheckedChange = { set(l.copy(solid = it)) })
+    }
+    if (!l.solid) {
+        CalRow("Blur radius", l.blurDp, 0f, 60f, 1f, "dp") { set(l.copy(blurDp = it)) }
+        CalRow("Black tint over blur", l.tint * 100f, 0f, 100f, 1f, "%") { set(l.copy(tint = it / 100f)) }
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("Blur follow: per frame (smooth)", style = MaterialTheme.typography.bodyMedium)
+                Text(
+                    "Off = resize the blur window each frame (steps, but a safe fallback if the smooth one " +
+                            "misbehaves on this phone).",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            Switch(checked = l.blurFollowView, onCheckedChange = { set(l.copy(blurFollowView = it)) })
+        }
+    }
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f)) {
+            Text("Bubble glow", style = MaterialTheme.typography.bodyMedium)
+            Text(
+                "While a card is open, the other activity's bubble glows softly in its colour.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+        Switch(checked = l.bubbleGlow, onCheckedChange = { set(l.copy(bubbleGlow = it)) })
+    }
+    OutlinedButton(onClick = { set(IslandLook()) }, modifier = Modifier.fillMaxWidth()) { Text("Reset card background") }
 }

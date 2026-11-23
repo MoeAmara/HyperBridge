@@ -116,7 +116,82 @@ data class IslandCalibration(
     /** Extra manual shift of the pill when its counter sits right of the camera. */
     val counterShiftPx: Float = 0f,
     /** With a bubble, a counter pill moves so its icon AND time sit fully right of the camera. */
-    val counterRight: Boolean = true
+    val counterRight: Boolean = true,
+    /** Bubble on the right of the pill instead of the left. */
+    val bubbleRight: Boolean = false,
+    /** Per-type small pill overrides (missing / negative fields = inherit the global values above). */
+    val pills: Map<PillType, PillDims> = emptyMap(),
+    /** Per-type expanded card overrides (negative = auto). */
+    val cards: Map<CardType, CardDims> = emptyMap()
+) {
+    fun pill(t: PillType): PillDims = pills[t] ?: PillDims()
+    fun card(t: CardType): CardDims = cards[t] ?: CardDims()
+}
+
+/** The small pills that can be sized separately. */
+enum class PillType(val label: String) {
+    MUSIC("Music"), CALL("Call"), TIMER("Timer"), STOPWATCH("Stopwatch"), RECORDER("Recorder"), INCOMING("Incoming call");
+
+    /** Default icon size (dp): icon / album art / waveform height. */
+    val defaultIconDp: Float
+        get() = when (this) {
+            MUSIC -> 22f
+            RECORDER -> 16f
+            INCOMING -> 19f
+            else -> 18f
+        }
+
+    /** Default text size (sp): time / "Incoming call"; for music = sound-wave height (dp). */
+    val defaultTextSp: Float
+        get() = when (this) {
+            MUSIC -> 14f
+            INCOMING -> 12.5f
+            else -> 15f
+        }
+}
+
+/** The expanded cards that can be sized separately. */
+enum class CardType(val label: String) {
+    MUSIC("Music"), CALL("Call"), TIMER("Timer"), STOPWATCH("Stopwatch"), RECORDER("Recorder");
+
+    val heightRatio: Float
+        get() = when (this) {
+            MUSIC -> IslandLayout.MUSIC_HEIGHT_RATIO
+            CALL -> IslandLayout.CALL_HEIGHT_RATIO
+            else -> IslandLayout.TIMER_HEIGHT_RATIO
+        }
+}
+
+/**
+ * One small pill's own size. Negative = inherit (width / height / padding from the global calibration,
+ * icon / text from the type's default). [radiusDp]: -2 = inherit, -1 = fully rounded, >= 0 explicit.
+ * [offsetXPx] is added to the global horizontal offset.
+ */
+data class PillDims(
+    val widthDp: Float = -1f,
+    val heightDp: Float = -1f,
+    val radiusDp: Float = -2f,
+    val padDp: Float = -1f,
+    val iconDp: Float = -1f,
+    val textSp: Float = -1f,
+    val offsetXPx: Float = 0f
+)
+
+/** One expanded card's own size (negative = auto from the reference videos). */
+data class CardDims(val widthDp: Float = -1f, val heightDp: Float = -1f, val radiusDp: Float = -1f)
+
+/** Card background: real blur strength, black tint over it, or plain solid black. */
+data class IslandLook(
+    /** Blur radius behind cards, dp. */
+    val blurDp: Float = 28f,
+    /** Opacity of the black tint drawn over the blur (0..1). */
+    val tint: Float = 0.55f,
+    /** Plain black card background, no blur at all. */
+    val solid: Boolean = false,
+    /** While a card is open, the bubble glows softly in its own colour. */
+    val bubbleGlow: Boolean = true,
+    /** Blur follows the card per frame by moving its view (smooth); false = resize the window (fallback). */
+    val blurFollowView: Boolean = true
 )
 
 /**
@@ -137,7 +212,13 @@ data class IslandMotion(
 )
 
 /** Which island contents hide the status-bar notification icons (all OFF by default). */
-data class IconHidePrefs(val call: Boolean = false, val timer: Boolean = false, val recorder: Boolean = false) {
+data class IconHidePrefs(
+    val call: Boolean = false,
+    val timer: Boolean = false,
+    val recorder: Boolean = false,
+    /** Hide whenever two activities run at once (pill + bubble), whatever they are. */
+    val multi: Boolean = false
+) {
     fun wants(kind: LiveKind?): Boolean = when (kind) {
         LiveKind.CALL, LiveKind.INCOMING_CALL -> call
         LiveKind.TIMER, LiveKind.STOPWATCH -> timer
@@ -167,7 +248,11 @@ data class PillFrame(
     val camLocalPx: Float,
     val padPx: Float,
     val gapPx: Float,
-    val rightOfCamera: Boolean
+    val rightOfCamera: Boolean,
+    /** Icon / art / waveform size for this pill type (dp). */
+    val iconDp: Float = 18f,
+    /** Text / time size for this pill type (sp; music: wave height dp). */
+    val textSp: Float = 15f
 )
 
 /** What a second-activity bubble shows. */
@@ -205,6 +290,9 @@ object IslandLayout {
     const val TIMER_HEIGHT_RATIO = 0.195f     // timer / stopwatch / recorder card height
     const val MUSIC_HEIGHT_RATIO = 0.42f      // expanded music card height
 
+    /** Tallest card the Layout screen allows (fraction of the screen width); the windows are sized for it. */
+    const val MAX_CARD_HEIGHT_RATIO = 0.62f
+
     /** Space between the icon and the time when both sit right of the camera. */
     private const val RIGHT_SPACING_DP = 7f
 
@@ -226,6 +314,69 @@ object IslandLayout {
     fun incomingWidthPx(g: IslandGeometry, c: IslandCalibration, density: Float): Float =
         if (c.incomingWidthDp > 0f) c.incomingWidthDp * density else autoIncomingWidthPx(g, c, density)
 
+    /** Which small pill type a mode shows ([stopwatch] splits the timer pill). */
+    fun pillTypeOf(mode: IslandMode, stopwatch: Boolean): PillType? = when (mode.compact()) {
+        IslandMode.COMPACT -> PillType.CALL
+        IslandMode.COMPACT_MUSIC -> PillType.MUSIC
+        IslandMode.INCOMING_PILL -> PillType.INCOMING
+        IslandMode.TIMER_PILL -> if (stopwatch) PillType.STOPWATCH else PillType.TIMER
+        IslandMode.REC_PILL -> PillType.RECORDER
+        else -> null
+    }
+
+    fun cardTypeOf(mode: IslandMode, stopwatch: Boolean): CardType? = when (mode) {
+        IslandMode.EXPANDED -> CardType.CALL
+        IslandMode.MUSIC -> CardType.MUSIC
+        IslandMode.TIMER_CARD -> if (stopwatch) CardType.STOPWATCH else CardType.TIMER
+        IslandMode.REC_CARD -> CardType.RECORDER
+        else -> null
+    }
+
+    /** A pill type's resolved size (every inherited field filled in), in px / dp / sp. */
+    data class PillResolved(
+        val widthPx: Float,
+        val heightPx: Float,
+        val radiusPx: Float,
+        val padPx: Float,
+        val iconDp: Float,
+        val textSp: Float,
+        val offsetXPx: Float,
+        /** True when the user set a width for this type (the long incoming pill keeps it exactly). */
+        val widthSet: Boolean
+    )
+
+    fun pillResolved(t: PillType, g: IslandGeometry, c: IslandCalibration, density: Float): PillResolved {
+        val p = c.pill(t)
+        val h = if (p.heightDp > 0f) p.heightDp * density else pillHeightPx(g, c, density)
+        val baseW = if (t == PillType.INCOMING) incomingWidthPx(g, c, density) else compactWidthPx(g, c, density)
+        val w = if (p.widthDp > 0f) p.widthDp * density else baseW
+        val rDp = if (p.radiusDp > -1.5f) p.radiusDp else c.radiusDp
+        val r = if (rDp >= 0f) min(rDp * density, h / 2f) else h / 2f
+        val padDp = if (p.padDp >= 0f) p.padDp else c.pillPadDp
+        return PillResolved(
+            widthPx = w,
+            heightPx = h,
+            radiusPx = r,
+            padPx = padDp.coerceIn(0f, 40f) * density,
+            iconDp = if (p.iconDp > 0f) p.iconDp else t.defaultIconDp,
+            textSp = if (p.textSp > 0f) p.textSp else t.defaultTextSp,
+            offsetXPx = p.offsetXPx,
+            widthSet = p.widthDp > 0f || (t == PillType.INCOMING && c.incomingWidthDp > 0f)
+        )
+    }
+
+    /** Resolved card size in px. */
+    fun cardRect(t: CardType, g: IslandGeometry, c: IslandCalibration, density: Float): IslandRectPx {
+        val screenW = g.screenWidthPx.toFloat()
+        val d = c.card(t)
+        val margin = screenW * CARD_MARGIN_RATIO
+        val top = max(g.statusBarHeightPx.toFloat(), g.cameraCenterYPx + g.cameraDiameterPx / 2f) + 6f * density
+        val w = if (d.widthDp > 0f) min(d.widthDp * density, screenW) else screenW - margin * 2f
+        val h = if (d.heightDp > 0f) min(d.heightDp * density, screenW * MAX_CARD_HEIGHT_RATIO) else screenW * t.heightRatio
+        val r = if (d.radiusDp >= 0f) min(d.radiusDp * density, min(w, h) / 2f) else screenW * CARD_RADIUS_RATIO
+        return IslandRectPx(cx = screenW / 2f + c.offsetXPx, top = top, w = w, h = h, r = r)
+    }
+
     fun bubbleSizePx(g: IslandGeometry, c: IslandCalibration, density: Float): Float =
         if (c.bubbleSizeDp > 0f) c.bubbleSizeDp * density else pillHeightPx(g, c, density)
 
@@ -238,23 +389,10 @@ object IslandLayout {
     private fun radius(h: Float, c: IslandCalibration, density: Float): Float =
         if (c.radiusDp >= 0f) min(c.radiusDp * density, h / 2f) else h / 2f
 
-    /** Expanded cards keep their Phase 1 size and vertical position; only the horizontal offset applies. */
-    private fun card(g: IslandGeometry, c: IslandCalibration, density: Float, heightRatio: Float): IslandRectPx {
-        val screenW = g.screenWidthPx.toFloat()
-        val margin = screenW * CARD_MARGIN_RATIO
-        val top = max(g.statusBarHeightPx.toFloat(), g.cameraCenterYPx + g.cameraDiameterPx / 2f) + 6f * density
-        return IslandRectPx(
-            cx = screenW / 2f + c.offsetXPx,
-            top = top,
-            w = screenW - margin * 2f,
-            h = screenW * heightRatio,
-            r = screenW * CARD_RADIUS_RATIO
-        )
-    }
-
     /**
      * Full plan for [mode]. [slots] = measured content widths (null = use the calibrated widths only),
-     * [withBubble] = a second activity is shown as a circle left of the pill.
+     * [withBubble] = a second activity is shown as a circle beside the pill. For a card, the bubble keeps
+     * the place it has next to that card's own pill, so it doesn't move when its partner expands.
      */
     fun plan(
         mode: IslandMode,
@@ -262,73 +400,85 @@ object IslandLayout {
         c: IslandCalibration,
         density: Float,
         slots: PillSlots?,
-        withBubble: Boolean
+        withBubble: Boolean,
+        stopwatch: Boolean = false
     ): IslandPlan {
-        when (mode) {
-            IslandMode.HIDDEN -> return IslandPlan(camera(g, c, density), null, null)
-            IslandMode.EXPANDED -> return IslandPlan(card(g, c, density, CALL_HEIGHT_RATIO), null, null)
-            IslandMode.TIMER_CARD, IslandMode.REC_CARD ->
-                return IslandPlan(card(g, c, density, TIMER_HEIGHT_RATIO), null, null)
-            IslandMode.MUSIC -> return IslandPlan(card(g, c, density, MUSIC_HEIGHT_RATIO), null, null)
-            else -> {}
+        if (mode == IslandMode.HIDDEN) return IslandPlan(camera(g, c, density), null, null)
+        if (mode.isCard()) {
+            val ct = cardTypeOf(mode, stopwatch) ?: CardType.CALL
+            val bubble = if (withBubble) plan(mode.compact(), g, c, density, slots, true, stopwatch).bubble else null
+            return IslandPlan(cardRect(ct, g, c, density), null, bubble)
         }
-        val h = pillHeightPx(g, c, density)
-        val r = radius(h, c, density)
-        val pad = c.pillPadDp.coerceIn(0f, 40f) * density
+        val type = pillTypeOf(mode, stopwatch)
+        val res = type?.let { pillResolved(it, g, c, density) }
+        val h = res?.heightPx ?: pillHeightPx(g, c, density)
+        val r = res?.radiusPx ?: radius(h, c, density)
+        val pad = res?.padPx ?: (c.pillPadDp.coerceIn(0f, 40f) * density)
+        val iconDp = res?.iconDp ?: 18f
+        val textSp = res?.textSp ?: 15f
         val gap = cameraGapPx(g, density)
         val camX = g.cameraCenterXPx + c.offsetXPx
         val camY = g.cameraCenterYPx + c.offsetYPx
         val top = camY - h / 2f
+        val shift = res?.offsetXPx ?: 0f
         val l = slots?.leftPx ?: 0f
         val rt = slots?.rightPx ?: 0f
         val base = when (mode) {
             IslandMode.WIDE -> wideWidthPx(g, c, density)
-            IslandMode.INCOMING_PILL -> incomingWidthPx(g, c, density)
-            else -> compactWidthPx(g, c, density)
+            else -> res?.widthPx ?: compactWidthPx(g, c, density)
         }
         val maxW = g.screenWidthPx * 0.9f
         // Centred on the camera: left content | camera | right content, `pad` at both ends.
         val centredNeed = 2f * (pad + max(l, rt)) + gap
         val bubble = withBubble && mode != IslandMode.WIDE
 
+        fun frame(w: Float, camLocal: Float, right: Boolean) = PillFrame(w, camLocal, pad, gap, right, iconDp, textSp)
+
         if (!bubble) {
             val w = when {
                 mode == IslandMode.WIDE -> base
                 // The incoming width is the user's to choose; only the icon must still fit (text ellipsizes).
-                mode == IslandMode.INCOMING_PILL && c.incomingWidthDp > 0f -> max(base, 2f * (pad + l) + gap)
-                else -> max(base, centredNeed)
+                mode == IslandMode.INCOMING_PILL && res?.widthSet == true -> max(base, 2f * (pad + l) + gap)
+                else -> maxOf(base, centredNeed, 2f * (pad + l + gap / 2f + shift), 2f * (pad + rt + gap / 2f - shift))
             }.coerceAtMost(maxW)
-            return IslandPlan(
-                IslandRectPx(camX, top, w, h, r),
-                PillFrame(w, w / 2f, pad, gap, false),
-                null
-            )
+            // A per-type horizontal shift moves the whole pill; the content keeps clear of the camera.
+            val cx = camX + shift
+            return IslandPlan(IslandRectPx(cx, top, w, h, r), frame(w, w / 2f - shift, false), null)
         }
 
         val b = bubbleSizePx(g, c, density)
         val bGap = c.bubbleGapDp.coerceIn(0f, 40f) * density
         val bubbleTop = camY - b / 2f
+        val right = c.bubbleRight
         if (isCounter(mode) && c.counterRight) {
             // Counter next to a bubble: the pill's left end covers the camera, icon + time sit right of it.
-            val w = (pad + gap + l + RIGHT_SPACING_DP * density + rt + pad).coerceAtMost(maxW)
-            val left = camX - gap / 2f - pad + c.counterShiftPx
+            val w = max(pad + gap + l + RIGHT_SPACING_DP * density + rt + pad, 0f).coerceAtMost(maxW)
+            val left = camX - gap / 2f - pad + c.counterShiftPx + shift
             val main = IslandRectPx(left + w / 2f, top, w, h, r)
-            val bub = IslandRectPx(left - bGap - b / 2f, bubbleTop, b, b, b / 2f)
-            return IslandPlan(main, PillFrame(w, camX - left, pad, gap, true), bub)
+            val bx = if (right) left + w + bGap + b / 2f else left - bGap - b / 2f
+            val bub = IslandRectPx(bx, bubbleTop, b, b, b / 2f)
+            return IslandPlan(main, frame(w, camX - left, true), bub)
         }
         // Bubble + pill centred together as one group; the pill still keeps its content clear of the camera.
-        val off = c.groupOffsetXPx
-        val w = maxOf(
+        val off = c.groupOffsetXPx + shift
+        val w = if (!right) maxOf(
             base,
             centredNeed,
             2f * (pad + l + gap / 2f + off) + b + bGap,
             2f * (pad + rt + gap / 2f - off) - b - bGap
-        ).coerceAtMost(maxW)
-        val groupLeft = camX + off - (b + bGap + w) / 2f
-        val pillLeft = groupLeft + b + bGap
-        val main = IslandRectPx(pillLeft + w / 2f, top, w, h, r)
-        val bub = IslandRectPx(groupLeft + b / 2f, bubbleTop, b, b, b / 2f)
-        return IslandPlan(main, PillFrame(w, camX - pillLeft, pad, gap, false), bub)
+        ) else maxOf(
+            base,
+            centredNeed,
+            2f * (pad + l + gap / 2f + off) - b - bGap,
+            2f * (pad + rt + gap / 2f - off) + b + bGap
+        )
+        val wc = w.coerceAtMost(maxW)
+        val groupLeft = camX + off - (b + bGap + wc) / 2f
+        val pillLeft = if (right) groupLeft else groupLeft + b + bGap
+        val bubCx = if (right) groupLeft + wc + bGap + b / 2f else groupLeft + b / 2f
+        val main = IslandRectPx(pillLeft + wc / 2f, top, wc, h, r)
+        val bub = IslandRectPx(bubCx, bubbleTop, b, b, b / 2f)
+        return IslandPlan(main, frame(wc, camX - pillLeft, false), bub)
     }
 
     /**
@@ -385,12 +535,35 @@ object IslandCalibrationStore {
             bubbleGapDp = p.getFloat("bubbleGapDp", 6f),
             groupOffsetXPx = p.getFloat("groupOffsetXPx", 0f),
             counterShiftPx = p.getFloat("counterShiftPx", 0f),
-            counterRight = p.getBoolean("counterRight", true)
+            counterRight = p.getBoolean("counterRight", true),
+            bubbleRight = p.getBoolean("bubbleRight", false),
+            pills = PillType.entries.mapNotNull { t ->
+                val k = "pill.${t.name}."
+                if (!p.getBoolean(k + "set", false)) return@mapNotNull null
+                t to PillDims(
+                    widthDp = p.getFloat(k + "w", -1f),
+                    heightDp = p.getFloat(k + "h", -1f),
+                    radiusDp = p.getFloat(k + "r", -2f),
+                    padDp = p.getFloat(k + "pad", -1f),
+                    iconDp = p.getFloat(k + "icon", -1f),
+                    textSp = p.getFloat(k + "text", -1f),
+                    offsetXPx = p.getFloat(k + "x", 0f)
+                )
+            }.toMap(),
+            cards = CardType.entries.mapNotNull { t ->
+                val k = "card.${t.name}."
+                if (!p.getBoolean(k + "set", false)) return@mapNotNull null
+                t to CardDims(
+                    widthDp = p.getFloat(k + "w", -1f),
+                    heightDp = p.getFloat(k + "h", -1f),
+                    radiusDp = p.getFloat(k + "r", -1f)
+                )
+            }.toMap()
         )
     }
 
     fun save(context: Context, c: IslandCalibration) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+        val e = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
             .putFloat("offsetXPx", c.offsetXPx)
             .putFloat("offsetYPx", c.offsetYPx)
             .putFloat("pillHeightDp", c.pillHeightDp)
@@ -404,7 +577,131 @@ object IslandCalibrationStore {
             .putFloat("groupOffsetXPx", c.groupOffsetXPx)
             .putFloat("counterShiftPx", c.counterShiftPx)
             .putBoolean("counterRight", c.counterRight)
+            .putBoolean("bubbleRight", c.bubbleRight)
+        for (t in PillType.entries) {
+            val k = "pill.${t.name}."
+            val d = c.pills[t]
+            e.putBoolean(k + "set", d != null)
+            if (d != null) {
+                e.putFloat(k + "w", d.widthDp).putFloat(k + "h", d.heightDp).putFloat(k + "r", d.radiusDp)
+                    .putFloat(k + "pad", d.padDp).putFloat(k + "icon", d.iconDp).putFloat(k + "text", d.textSp)
+                    .putFloat(k + "x", d.offsetXPx)
+            }
+        }
+        for (t in CardType.entries) {
+            val k = "card.${t.name}."
+            val d = c.cards[t]
+            e.putBoolean(k + "set", d != null)
+            if (d != null) e.putFloat(k + "w", d.widthDp).putFloat(k + "h", d.heightDp).putFloat(k + "r", d.radiusDp)
+        }
+        e.apply()
+    }
+
+    fun loadLook(context: Context): IslandLook {
+        val p = context.getSharedPreferences(OPTIONS_PREFS, Context.MODE_PRIVATE)
+        val d = IslandLook()
+        return IslandLook(
+            blurDp = p.getFloat("look.blurDp", d.blurDp),
+            tint = p.getFloat("look.tint", d.tint),
+            solid = p.getBoolean("look.solid", d.solid),
+            bubbleGlow = p.getBoolean("look.bubbleGlow", d.bubbleGlow),
+            blurFollowView = p.getBoolean("look.blurFollowView", d.blurFollowView)
+        )
+    }
+
+    fun saveLook(context: Context, l: IslandLook) {
+        context.getSharedPreferences(OPTIONS_PREFS, Context.MODE_PRIVATE).edit()
+            .putFloat("look.blurDp", l.blurDp)
+            .putFloat("look.tint", l.tint)
+            .putBoolean("look.solid", l.solid)
+            .putBoolean("look.bubbleGlow", l.bubbleGlow)
+            .putBoolean("look.blurFollowView", l.blurFollowView)
             .apply()
+    }
+
+    // ---- Export / import (JSON) ----------------------------------------------------------------
+
+    fun exportJson(c: IslandCalibration, m: IslandMotion, l: IslandLook): String {
+        val o = org.json.JSONObject()
+        o.put("format", "hyperbridge-island-layout")
+        o.put("version", 1)
+        val cal = org.json.JSONObject()
+        cal.put("offsetXPx", c.offsetXPx.toDouble()); cal.put("offsetYPx", c.offsetYPx.toDouble())
+        cal.put("pillHeightDp", c.pillHeightDp.toDouble()); cal.put("compactWidthDp", c.compactWidthDp.toDouble())
+        cal.put("wideWidthDp", c.wideWidthDp.toDouble()); cal.put("radiusDp", c.radiusDp.toDouble())
+        cal.put("pillPadDp", c.pillPadDp.toDouble()); cal.put("incomingWidthDp", c.incomingWidthDp.toDouble())
+        cal.put("bubbleSizeDp", c.bubbleSizeDp.toDouble()); cal.put("bubbleGapDp", c.bubbleGapDp.toDouble())
+        cal.put("groupOffsetXPx", c.groupOffsetXPx.toDouble()); cal.put("counterShiftPx", c.counterShiftPx.toDouble())
+        cal.put("counterRight", c.counterRight); cal.put("bubbleRight", c.bubbleRight)
+        val pills = org.json.JSONObject()
+        for ((t, d) in c.pills) {
+            pills.put(t.name, org.json.JSONObject().apply {
+                put("w", d.widthDp.toDouble()); put("h", d.heightDp.toDouble()); put("r", d.radiusDp.toDouble())
+                put("pad", d.padDp.toDouble()); put("icon", d.iconDp.toDouble()); put("text", d.textSp.toDouble())
+                put("x", d.offsetXPx.toDouble())
+            })
+        }
+        cal.put("pills", pills)
+        val cards = org.json.JSONObject()
+        for ((t, d) in c.cards) {
+            cards.put(t.name, org.json.JSONObject().apply {
+                put("w", d.widthDp.toDouble()); put("h", d.heightDp.toDouble()); put("r", d.radiusDp.toDouble())
+            })
+        }
+        cal.put("cards", cards)
+        o.put("calibration", cal)
+        o.put("motion", org.json.JSONObject().apply {
+            put("bounce", m.bounce.toDouble()); put("speed", m.speed.toDouble()); put("jelly", m.jelly)
+            put("jellyAmount", m.jellyAmount.toDouble()); put("blurDp", m.blurDp.toDouble())
+        })
+        o.put("look", org.json.JSONObject().apply {
+            put("blurDp", l.blurDp.toDouble()); put("tint", l.tint.toDouble()); put("solid", l.solid)
+            put("bubbleGlow", l.bubbleGlow); put("blurFollowView", l.blurFollowView)
+        })
+        return o.toString(2)
+    }
+
+    /** Parses an exported JSON; throws with a readable message when it isn't one. */
+    fun importJson(text: String, cur: Triple<IslandCalibration, IslandMotion, IslandLook>): Triple<IslandCalibration, IslandMotion, IslandLook> {
+        val o = org.json.JSONObject(text.trim())
+        require(o.optString("format") == "hyperbridge-island-layout") { "not an island layout export" }
+        fun org.json.JSONObject.f(k: String, d: Float) = if (has(k)) optDouble(k, d.toDouble()).toFloat() else d
+        val (c0, m0, l0) = cur
+        val cal = o.optJSONObject("calibration")
+        val c = if (cal == null) c0 else {
+            val d = IslandCalibration()
+            val pj = cal.optJSONObject("pills")
+            val cj = cal.optJSONObject("cards")
+            IslandCalibration(
+                offsetXPx = cal.f("offsetXPx", d.offsetXPx), offsetYPx = cal.f("offsetYPx", d.offsetYPx),
+                pillHeightDp = cal.f("pillHeightDp", d.pillHeightDp), compactWidthDp = cal.f("compactWidthDp", d.compactWidthDp),
+                wideWidthDp = cal.f("wideWidthDp", d.wideWidthDp), radiusDp = cal.f("radiusDp", d.radiusDp),
+                pillPadDp = cal.f("pillPadDp", d.pillPadDp), incomingWidthDp = cal.f("incomingWidthDp", d.incomingWidthDp),
+                bubbleSizeDp = cal.f("bubbleSizeDp", d.bubbleSizeDp), bubbleGapDp = cal.f("bubbleGapDp", d.bubbleGapDp),
+                groupOffsetXPx = cal.f("groupOffsetXPx", d.groupOffsetXPx), counterShiftPx = cal.f("counterShiftPx", d.counterShiftPx),
+                counterRight = cal.optBoolean("counterRight", d.counterRight),
+                bubbleRight = cal.optBoolean("bubbleRight", d.bubbleRight),
+                pills = PillType.entries.mapNotNull { t ->
+                    val j = pj?.optJSONObject(t.name) ?: return@mapNotNull null
+                    t to PillDims(j.f("w", -1f), j.f("h", -1f), j.f("r", -2f), j.f("pad", -1f), j.f("icon", -1f), j.f("text", -1f), j.f("x", 0f))
+                }.toMap(),
+                cards = CardType.entries.mapNotNull { t ->
+                    val j = cj?.optJSONObject(t.name) ?: return@mapNotNull null
+                    t to CardDims(j.f("w", -1f), j.f("h", -1f), j.f("r", -1f))
+                }.toMap()
+            )
+        }
+        val mj = o.optJSONObject("motion")
+        val m = if (mj == null) m0 else IslandMotion(
+            mj.f("bounce", m0.bounce), mj.f("speed", m0.speed), mj.optBoolean("jelly", m0.jelly),
+            mj.f("jellyAmount", m0.jellyAmount), mj.f("blurDp", m0.blurDp)
+        )
+        val lj = o.optJSONObject("look")
+        val l = if (lj == null) l0 else IslandLook(
+            lj.f("blurDp", l0.blurDp), lj.f("tint", l0.tint), lj.optBoolean("solid", l0.solid),
+            lj.optBoolean("bubbleGlow", l0.bubbleGlow), lj.optBoolean("blurFollowView", l0.blurFollowView)
+        )
+        return Triple(c, m, l)
     }
 
     // v2: one-spring liquid morph; the old Phase 3 keys (width lead, squeeze) are ignored.
@@ -448,7 +745,8 @@ object IslandCalibrationStore {
         return IconHidePrefs(
             call = p.getBoolean("hideIconsCall", false),
             timer = p.getBoolean("hideIconsTimer", false),
-            recorder = p.getBoolean("hideIconsRecorder", false)
+            recorder = p.getBoolean("hideIconsRecorder", false),
+            multi = p.getBoolean("hideIconsMulti", false)
         )
     }
 
@@ -457,6 +755,7 @@ object IslandCalibrationStore {
             .putBoolean("hideIconsCall", v.call)
             .putBoolean("hideIconsTimer", v.timer)
             .putBoolean("hideIconsRecorder", v.recorder)
+            .putBoolean("hideIconsMulti", v.multi)
             .apply()
     }
 }
@@ -547,13 +846,46 @@ object IslandController {
         _blurState.value = s
     }
 
-    /** Settled expanded-card bounds the service puts its blur window behind (null = no blur window). */
-    private val _blurRect = MutableStateFlow<IslandRectPx?>(null)
-    val blurRect: StateFlow<IslandRectPx?> = _blurRect.asStateFlow()
+    /**
+     * Where the blur behind the card is right now (null = no blur): published EVERY animation frame by
+     * the overlay while a card is growing / open / shrinking, so the blur follows the shape from frame 1.
+     */
+    private val _blurFrame = MutableStateFlow<IslandRectPx?>(null)
+    val blurFrame: StateFlow<IslandRectPx?> = _blurFrame.asStateFlow()
 
-    internal fun setBlurRect(r: IslandRectPx?) {
-        if (_blurRect.value != r) _blurRect.value = r
+    internal fun setBlurFrame(r: IslandRectPx?) {
+        if (_blurFrame.value != r) _blurFrame.value = r
     }
+
+    /** Card background look (blur strength, tint, solid black, bubble glow). */
+    private val _look = MutableStateFlow(IslandLook())
+    val look: StateFlow<IslandLook> = _look.asStateFlow()
+
+    fun setLook(l: IslandLook) {
+        _look.value = l
+    }
+
+    /** Island Test / Layout screen: the mock timer pill / card is a stopwatch. */
+    private val _mockStopwatch = MutableStateFlow(false)
+
+    /** The Layout screen is previewing: small pill -> small pill switches resize directly on the island spring. */
+    private val _layoutPreview = MutableStateFlow(false)
+    val layoutPreview: StateFlow<Boolean> = _layoutPreview.asStateFlow()
+
+    fun setLayoutPreview(on: Boolean) {
+        _layoutPreview.value = on
+    }
+    val mockStopwatch: StateFlow<Boolean> = _mockStopwatch.asStateFlow()
+
+    /**
+     * Bumped when the main content and the bubble trade places (tap on the bubble). The overlay then
+     * runs the liquid swap: the bubble grows into the main shape, the main shrinks into the bubble slot.
+     */
+    data class Swap(val seq: Int, val oldMain: IslandMode, val oldMainStopwatch: Boolean, val oldBubble: IslandBubble)
+
+    private val _swap = MutableStateFlow<Swap?>(null)
+    val swap: StateFlow<Swap?> = _swap.asStateFlow()
+    private var swapSeq = 0
 
     /** Result of the last automatic status-bar command (for Island Test). */
     private val _iconHideStatus = MutableStateFlow("idle")
@@ -675,7 +1007,8 @@ object IslandController {
 
     private fun updateBubble() {
         val m = _mode.value
-        if (m == IslandMode.HIDDEN || m.isCard() || m == IslandMode.WIDE) {
+        // The bubble stays while its partner is expanded into a card.
+        if (m == IslandMode.HIDDEN || m == IslandMode.WIDE) {
             _bubble.value = null
             return
         }
@@ -765,8 +1098,8 @@ object IslandController {
 
     // ---- Test buttons ----------------------------------------------------------------------
 
-    /** Test buttons: show a mock state. */
-    fun show(mode: IslandMode) {
+    /** Test buttons: show a mock state ([stopwatch] = the mock timer is a stopwatch). */
+    fun show(mode: IslandMode, stopwatch: Boolean = false) {
         if (mode == IslandMode.HIDDEN) {
             hide()
             return
@@ -774,14 +1107,15 @@ object IslandController {
         restorableId = null
         _restorable.value = null
         mockBubble = null
+        _mockStopwatch.value = stopwatch
         seen = activities().map { it.id }.toSet()
         setMode(mode, null, emptyList())
         updateBubble()
     }
 
     /** Island Test: two activities at once (main pill + bubble). */
-    fun showTwo(main: IslandMode, second: BubbleKind) {
-        show(main)
+    fun showTwo(main: IslandMode, second: BubbleKind, stopwatch: Boolean = false) {
+        show(main, stopwatch)
         mockBubble = second
         updateBubble()
     }
@@ -839,27 +1173,45 @@ object IslandController {
     private fun onBubble(x: Float, y: Float): Boolean {
         if (x.isNaN() || _bubble.value == null) return false
         val b = _layoutBubble.value ?: return false
+        val inBubble = x >= b.left && x <= b.left + b.w && y >= b.top && y <= b.top + b.h
+        if (inBubble) return true
+        // Touch slack around the bubble, but the pill / card wins where the two overlap.
+        val m = _layoutMain.value
+        if (m != null && x >= m.left && x <= m.left + m.w && y >= m.top && y <= m.top + m.h) return false
         val slack = b.w * 0.15f
-        return x >= b.left - slack && x <= b.left + b.w + slack && y <= b.top + b.h + slack * 2f
+        return x >= b.left - slack && x <= b.left + b.w + slack && y <= b.top + b.h + slack
     }
 
-    /** Tap on the bubble: it becomes the main pill and the main becomes the bubble. */
+    /**
+     * Tap on the bubble: it becomes the main content and the main becomes the bubble. With a card open,
+     * the bubble's content opens straight into ITS card (and the old card shrinks into the bubble).
+     */
     private fun swapWithBubble() {
         val b = _bubble.value ?: return
         val m = _mode.value
+        val wasCard = m.isCard()
+        fun target(pill: IslandMode): IslandMode = if (wasCard) pill.card() ?: pill else pill
+        _swap.value = Swap(++swapSeq, m, _mockStopwatch.value || _shownLive.value?.kind == LiveKind.STOPWATCH, b)
         if (b.id == null) {
             // Mock: swap the two mock contents.
-            val newMain = pillOf(b.kind)
+            val newMain = target(pillOf(b.kind))
             val newBubble = bubbleOfMock(m)
+            val sw = b.kind == BubbleKind.STOPWATCH
             setMode(newMain, null, emptyList())
             mockBubble = newBubble
+            _mockStopwatch.value = sw
             updateBubble()
             return
         }
         val acts = activities()
         val a = acts.firstOrNull { it.id == b.id } ?: return
         swapHold = a.id
-        show(a, acts)
+        suppressed -= a.id
+        if (restorableId == a.id) {
+            restorableId = null
+            _restorable.value = null
+        }
+        setMode(target(compactModeOf(a)), a.id, acts)
         updateBubble()
     }
 
@@ -874,7 +1226,7 @@ object IslandController {
     private fun bubbleOfMock(m: IslandMode): BubbleKind? = when (m.compact()) {
         IslandMode.COMPACT -> BubbleKind.CALL
         IslandMode.INCOMING_PILL -> BubbleKind.INCOMING
-        IslandMode.TIMER_PILL -> BubbleKind.TIMER
+        IslandMode.TIMER_PILL -> if (_mockStopwatch.value) BubbleKind.STOPWATCH else BubbleKind.TIMER
         IslandMode.REC_PILL -> BubbleKind.RECORDER
         IslandMode.COMPACT_MUSIC -> BubbleKind.MUSIC
         else -> null
@@ -930,6 +1282,14 @@ object IslandController {
             return
         }
         val m = _mode.value
+        if (m.isCard() && !x.isNaN()) {
+            // With a bubble the touch area also spans the row beside it: a tap there is "outside" the card.
+            val r = _layoutMain.value
+            if (r != null && (x < r.left || x > r.left + r.w || y < r.top - 4f || y > r.top + r.h)) {
+                onOutsideTouch()
+                return
+            }
+        }
         if (m == IslandMode.INCOMING_PILL) {
             // The phone's own incoming-call screen is the "expanded" view.
             val live = _shownLive.value

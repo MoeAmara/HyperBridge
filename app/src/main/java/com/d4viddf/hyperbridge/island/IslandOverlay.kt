@@ -54,6 +54,7 @@ import androidx.compose.runtime.State
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
@@ -125,12 +126,14 @@ object IslandSpec {
     val HandleGrey = Color(0x40FFFFFF)
 }
 
-/** Where pill content sits (camera position inside the pill, padding at both ends). */
+/** Where pill content sits (camera position inside the pill, padding at both ends, icon / text sizes). */
 private val LocalPillFrame = compositionLocalOf<PillFrame?> { null }
+
+/** Mock timer contents (Island Test / Layout) draw as a stopwatch. */
+private val LocalMockStopwatch = compositionLocalOf { false }
 
 /** Expanded card fill: frosted tint over the real blur, or dark translucent when blur is unavailable. */
 private val CardFallbackFill = Color(0xE01C1C1E)
-private val CardBlurTint = Color(0x8C0E0E10)
 
 // Grow out of the camera / shrink back into it (unchanged since Phase 1.1 — Moe likes it).
 private val GROW_W: AnimationSpec<Float> = spring(dampingRatio = 0.74f, stiffness = 540f)
@@ -241,8 +244,22 @@ private class BubbleAnim {
     val content = Animatable(0f)
 }
 
-/** Content widths of a pill (null for cards / hidden / the mock charging pill). */
-private fun pillSlots(mode: IslandMode, live: IslandLive?, mockSeconds: Int, tm: TextMeasurer, d: Float): PillSlots? {
+/** Content widths of a pill (null for cards / hidden / the mock charging pill), at its type's icon / text size. */
+private fun pillSlots(
+    mode: IslandMode,
+    live: IslandLive?,
+    mockSeconds: Int,
+    tm: TextMeasurer,
+    d: Float,
+    g: IslandGeometry,
+    c: IslandCalibration,
+    stopwatch: Boolean
+): PillSlots? {
+    val type = IslandLayout.pillTypeOf(mode, stopwatch) ?: return null
+    if (mode.isCard()) return null
+    val res = IslandLayout.pillResolved(type, g, c, d)
+    val icon = res.iconDp
+    val text = res.textSp
     fun textW(t: String, size: TextUnit, tnum: Boolean): Float = tm.measure(
         t,
         TextStyle(fontSize = size, fontWeight = FontWeight.SemiBold, fontFeatureSettings = if (tnum) "tnum" else null),
@@ -255,10 +272,10 @@ private fun pillSlots(mode: IslandMode, live: IslandLive?, mockSeconds: Int, tm:
             // Every digit counted as "0" so the width doesn't change every second.
             val digits = t.any { it.isDigit() }
             val tmpl = if (digits) t.map { if (it.isDigit()) '0' else it }.joinToString("") else t
-            PillSlots(pillLeftDp(mode) * d, textW(tmpl, PillTimeSize, digits) + 1.5f * d)
+            PillSlots(pillLeftDp(mode, icon) * d, textW(tmpl, text.sp, digits) + 1.5f * d)
         }
-        IslandMode.COMPACT_MUSIC -> PillSlots(22f * d, 18f * d)
-        IslandMode.INCOMING_PILL -> PillSlots(19f * d, textW("Incoming call", IncomingTextSize, false) + 1.5f * d)
+        IslandMode.COMPACT_MUSIC -> PillSlots(icon * d, waveWidthDp(text) * d)
+        IslandMode.INCOMING_PILL -> PillSlots(icon * d, textW("Incoming call", text.sp, false) + 1.5f * d)
         else -> null
     }
 }
@@ -274,9 +291,14 @@ fun IslandOverlay(
     val d = density.density
     val blurPx = with(density) { 6.dp.toPx() }
     val motion by IslandController.motion.collectAsState()
+    val look by IslandController.look.collectAsState()
     val live by IslandController.shownLive.collectAsState()
     val bubble by IslandController.bubble.collectAsState()
     val blurState by IslandController.blurState.collectAsState()
+    val mockStopwatch by IslandController.mockStopwatch.collectAsState()
+    val swap by IslandController.swap.collectAsState()
+    val layoutPreview by IslandController.layoutPreview.collectAsState()
+    val latestPreview by rememberUpdatedState(layoutPreview)
     val textMeasurer = rememberTextMeasurer()
 
     // Shared mock clock so mock timers keep running across compact <-> expanded.
@@ -293,15 +315,22 @@ fun IslandOverlay(
     val latestLive by rememberUpdatedState(live)
     val latestMock by rememberUpdatedState(mockSeconds)
     val latestBubble by rememberUpdatedState(bubble)
+    val latestStopwatch by rememberUpdatedState(mockStopwatch)
+    val latestSwap by rememberUpdatedState(swap)
 
-    fun withBubble(m: IslandMode, b: IslandBubble?): Boolean =
-        b != null && m != IslandMode.HIDDEN && !m.isCard()
+    fun isStopwatch(l: IslandLive?, mock: Boolean) = l?.kind == LiveKind.STOPWATCH || (l == null && mock)
 
-    fun planOf(m: IslandMode): IslandPlan = IslandLayout.plan(
-        m, latestGeometry, latestCalibration, d,
-        pillSlots(m, latestLive, latestMock, textMeasurer, d),
-        withBubble(m, latestBubble)
-    )
+    fun withBubble(m: IslandMode, b: IslandBubble?): Boolean = b != null && m != IslandMode.HIDDEN
+
+    fun planOf(m: IslandMode): IslandPlan {
+        val sw = isStopwatch(latestLive, latestStopwatch)
+        return IslandLayout.plan(
+            m, latestGeometry, latestCalibration, d,
+            pillSlots(m, latestLive, latestMock, textMeasurer, d, latestGeometry, latestCalibration, sw),
+            withBubble(m, latestBubble),
+            sw
+        )
+    }
 
     fun targetOf(m: IslandMode): IslandRectPx = planOf(m).main
 
@@ -312,16 +341,101 @@ fun IslandOverlay(
 
     val anim = remember { IslandAnim(IslandLayout.camera(geometry, calibration, d), blurPx) }
     val bAnim = remember { BubbleAnim() }
-    val blurMix = remember { Animatable(0f) }
+    val ghost = remember { GhostAnim() }
+    val glow = remember { Animatable(0f) }
     var displayedMode by remember { mutableStateOf(IslandMode.HIDDEN) }
     var transitioning by remember { mutableStateOf(false) }
     var morph by remember { mutableStateOf<Morph?>(null) }
     var shownBubble by remember { mutableStateOf<IslandBubble?>(null) }
+    /** A liquid swap is running: the bubble effect waits, the ghost shape is drawn. */
+    var swapping by remember { mutableStateOf<GhostInfo?>(null) }
+    var handledSwap by remember { mutableIntStateOf(swap?.seq ?: 0) }
 
-    LaunchedEffect(mode) {
+    LaunchedEffect(mode, swap?.seq) {
         transitioning = true
         morph = null
         val from = displayedMode
+        val sw = latestSwap
+        if (sw != null && sw.seq != handledSwap) {
+            handledSwap = sw.seq
+            val newBubble = latestBubble
+            val bubbleSlot = planOf(mode).bubble
+            if (mode != IslandMode.HIDDEN && from == sw.oldMain && anim.shapeAlpha.value > 0.5f &&
+                bAnim.alpha.value > 0.5f && newBubble != null && bubbleSlot != null
+            ) {
+                // ---- Liquid swap: the bubble grows into the main shape while the main shrinks into the slot.
+                val mo = latestMotion
+                val damping = mo.bounce.coerceIn(0.3f, 1f)
+                val stiffness = mo.speed.coerceIn(60f, 3000f)
+                val sp = spring<Float>(dampingRatio = damping, stiffness = stiffness)
+                val fadeSpec = spring<Float>(dampingRatio = 1f, stiffness = (stiffness * 4f).coerceIn(300f, 8000f))
+                val oldMainRect = IslandRectPx(
+                    anim.cx.value, anim.top.value,
+                    anim.w.value * anim.jx.value, anim.h.value * anim.jy.value, anim.r.value
+                )
+                val oldBubbleSize = bAnim.size.value
+                val oldBubbleRect = IslandRectPx(bAnim.cx.value, bAnim.top.value, oldBubbleSize, oldBubbleSize, oldBubbleSize / 2f)
+                val info = GhostInfo(
+                    mode = sw.oldMain,
+                    stopwatch = sw.oldMainStopwatch,
+                    live = newBubble.live,
+                    bubble = newBubble,
+                    fromPlan = IslandLayout.plan(
+                        sw.oldMain, latestGeometry, latestCalibration, d,
+                        pillSlots(sw.oldMain, newBubble.live, latestMock, textMeasurer, d, latestGeometry, latestCalibration, sw.oldMainStopwatch),
+                        true, sw.oldMainStopwatch
+                    )
+                )
+                // Ghost = the old main, starting exactly where it is now.
+                ghost.snap(oldMainRect, anim.cardness.value)
+                ghost.oldContent.snapTo(1f)
+                ghost.newContent.snapTo(0f)
+                swapping = info
+                bAnim.alpha.snapTo(0f)
+                shownBubble = newBubble
+                // Main = the tapped item, starting as the bubble circle it was.
+                anim.snapShape(oldBubbleRect)
+                anim.jx.snapTo(1f)
+                anim.jy.snapTo(1f)
+                anim.cardness.snapTo(0f)
+                anim.shapeAlpha.snapTo(1f)
+                anim.contentAlpha.snapTo(0f)
+                anim.contentBlur.snapTo(blurPx)
+                anim.contentScale.snapTo(1f)
+                displayedMode = mode
+                val tgt = targetOf(mode)
+                try {
+                    coroutineScope {
+                        launch { anim.animateShape(tgt, sp, sp, sp) }
+                        launch { anim.cardness.animateTo(if (mode.isCard()) 1f else 0f, tween(220)) }
+                        launch {
+                            delay(60)
+                            coroutineScope {
+                                launch { anim.contentAlpha.animateTo(1f, fadeSpec) }
+                                launch { anim.contentBlur.animateTo(0f, tween(220)) }
+                            }
+                        }
+                        launch { ghost.animateTo(bubbleSlot, sp) }
+                        launch { ghost.cardness.animateTo(0f, tween(200)) }
+                        launch { ghost.oldContent.animateTo(0f, tween(130, easing = LinearEasing)) }
+                        launch {
+                            delay(110)
+                            ghost.newContent.animateTo(1f, tween(170))
+                        }
+                    }
+                } finally {
+                    // Hand over to the real bubble at the same place, same content.
+                    bAnim.cx.snapTo(bubbleSlot.cx)
+                    bAnim.top.snapTo(bubbleSlot.top)
+                    bAnim.size.snapTo(bubbleSlot.w)
+                    bAnim.content.snapTo(1f)
+                    bAnim.alpha.snapTo(1f)
+                    swapping = null
+                }
+                transitioning = false
+                return@LaunchedEffect
+            }
+        }
         if (mode == IslandMode.HIDDEN) {
             if (from != IslandMode.HIDDEN && anim.shapeAlpha.value > 0f) {
                 anim.contentOut()
@@ -391,7 +505,7 @@ fun IslandOverlay(
                 return@LaunchedEffect
             } else if (from != mode) {
                 anim.contentOut()
-                if (!(from.isCard() && !mode.isCard())) {
+                if (!(from.isCard() && !mode.isCard()) && !(latestPreview && sameFamily(from, mode))) {
                     // Unrelated contents: contract toward the camera, then grow into the new shape.
                     coroutineScope {
                         launch { anim.cardness.animateTo(0f, tween(120)) }
@@ -409,9 +523,16 @@ fun IslandOverlay(
             anim.contentScale.snapTo(0.9f)
             anim.contentBlur.snapTo(blurPx)
             val tgt = targetOf(mode)
+            val sameShapeFamily = latestPreview && from != IslandMode.HIDDEN && sameFamily(from, mode)
             coroutineScope {
                 launch { anim.cardness.animateTo(if (mode.isCard()) 1f else 0f, tween(220)) }
-                launch { anim.animateShape(tgt, GROW_W, GROW_H, GROW_POS) }
+                launch {
+                    // Small pill -> small pill of another type: straight to its own size on the island spring.
+                    if (sameShapeFamily) {
+                        val sp = islandSpring()
+                        anim.animateShape(tgt, sp, sp, sp)
+                    } else anim.animateShape(tgt, GROW_W, GROW_H, GROW_POS)
+                }
                 launch {
                     // Content appears only once the shape is ~70% grown.
                     val useH = abs(tgt.h - anim.h.value) > abs(tgt.w - anim.w.value)
@@ -435,18 +556,21 @@ fun IslandOverlay(
     }
 
     // The plan for what is requested right now (measured content + bubble), used for following,
-    // for the touch window and for the blur window.
+    // for the touch window and for the bubble.
+    val stopwatchNow = isStopwatch(live, mockStopwatch)
     val livePlan = IslandLayout.plan(
         mode, geometry, calibration, d,
-        pillSlots(mode, live, mockSeconds, textMeasurer, d),
-        withBubble(mode, bubble)
+        pillSlots(mode, live, mockSeconds, textMeasurer, d, geometry, calibration, stopwatchNow),
+        withBubble(mode, bubble),
+        stopwatchNow
     )
     LaunchedEffect(livePlan, mode) {
         IslandController.setLayout(if (mode == IslandMode.HIDDEN) null else livePlan.main, livePlan.bubble)
     }
 
-    // Calibration, a bubble arriving / leaving, or a counter growing (59:59 -> 1:00:00): follow with the
-    // island spring. Keyed on `transitioning` too, so a change that lands mid-animation is applied after it.
+    // Calibration / Layout edits, a bubble arriving / leaving, or a counter growing (59:59 -> 1:00:00):
+    // follow with the island spring. Keyed on `transitioning` too, so a change that lands mid-animation
+    // is applied after it.
     LaunchedEffect(livePlan.main, transitioning, displayedMode) {
         if (!transitioning && displayedMode == mode && mode != IslandMode.HIDDEN) {
             val sp = islandSpring()
@@ -454,16 +578,20 @@ fun IslandOverlay(
         }
     }
 
-    // Second activity: splits out of the pill's left side, merges back into it when it ends.
+    // Second activity: splits out of the pill's side (left or right), merges back into it when it ends.
     val bubbleTarget = livePlan.bubble
-    LaunchedEffect(bubbleTarget, bubble?.kind, bubble?.id) {
+    val bubbleRight = calibration.bubbleRight
+    LaunchedEffect(bubbleTarget, bubble?.kind, bubble?.id, swapping == null) {
+        if (swapping != null) return@LaunchedEffect
         val b = bubble
         if (bubbleTarget != null && b != null) {
             val sp = islandSpring()
             if (bAnim.alpha.value < 0.5f) {
                 shownBubble = b
-                val pill = livePlan.main
-                bAnim.cx.snapTo(pill.left + bubbleTarget.w / 2f)
+                // Split out of the matching edge of the pill row (for a card: of the pill it came from).
+                val pill = if (mode.isCard()) planOf(mode.compact()).main else livePlan.main
+                val startCx = if (bubbleRight) pill.left + pill.w - bubbleTarget.w / 2f else pill.left + bubbleTarget.w / 2f
+                bAnim.cx.snapTo(startCx)
                 bAnim.top.snapTo(bubbleTarget.top)
                 bAnim.size.snapTo(bubbleTarget.w)
                 bAnim.content.snapTo(0f)
@@ -496,7 +624,11 @@ fun IslandOverlay(
             }
         } else if (bAnim.alpha.value > 0f) {
             bAnim.content.animateTo(0f, tween(70))
-            val into = anim.cx.value - anim.w.value / 2f + bAnim.size.value / 2f
+            val into = if (anim.cardness.value > 0.5f) {
+                // Its partner is a card: shrink into the camera instead.
+                IslandLayout.camera(geometry, calibration, d).cx
+            } else if (bubbleRight) anim.cx.value + anim.w.value / 2f - bAnim.size.value / 2f
+            else anim.cx.value - anim.w.value / 2f + bAnim.size.value / 2f
             coroutineScope {
                 launch { bAnim.cx.animateTo(into, spring(dampingRatio = 1f, stiffness = 700f)) }
                 launch {
@@ -509,24 +641,90 @@ fun IslandOverlay(
         }
     }
 
-    // Real blur behind a settled card: the service puts a blur window exactly behind it, then the card's
-    // fill turns from dark translucent into a frosted tint. Collapse = back to the solid fill at once.
-    val cardSettled = displayedMode == mode && mode.isCard() && !transitioning
-    LaunchedEffect(cardSettled, livePlan.main, blurState.real) {
-        if (cardSettled && blurState.real) {
-            IslandController.setBlurRect(livePlan.main)
-            delay(90)
-            blurMix.animateTo(1f, tween(200))
-        } else {
-            blurMix.snapTo(0f)
-            IslandController.setBlurRect(null)
+    // Glow around the bubble while its partner is an open card (creative extra, can be turned off).
+    val glowOn = look.bubbleGlow && mode.isCard() && bubble != null
+    LaunchedEffect(glowOn) {
+        glow.animateTo(if (glowOn) 1f else 0f, tween(if (glowOn) 380 else 160))
+    }
+
+    // ---- Blur from the first frame -------------------------------------------------------------
+    // Every frame while a card is growing / open / shrinking, publish the card's current shape; the
+    // service moves the blur region to it (no window relayout), so the blur follows the spring.
+    val blurOn = blurState.real && !look.solid
+    LaunchedEffect(blurOn) {
+        if (!blurOn) {
+            IslandController.setBlurFrame(null)
+            return@LaunchedEffect
+        }
+        try {
+            snapshotFlow {
+                val g = swapping
+                val mainCard = anim.cardness.value
+                val ghostCard = if (g != null) ghost.cardness.value else 0f
+                when {
+                    anim.shapeAlpha.value < 0.05f && ghostCard < 0.01f -> null
+                    mainCard >= ghostCard && mainCard > 0.01f -> {
+                        // The shape is scaled from its top centre by the jelly.
+                        val w = anim.w.value * anim.jx.value
+                        val h = anim.h.value * anim.jy.value
+                        val inset = 1f * d
+                        IslandRectPx(
+                            anim.cx.value, anim.top.value + inset * 0.5f,
+                            (w - 2f * inset).coerceAtLeast(1f), (h - inset).coerceAtLeast(1f),
+                            (anim.r.value.coerceIn(0f, minOf(w, h) / 2f) - inset).coerceAtLeast(0f)
+                        )
+                    }
+                    ghostCard > 0.01f -> IslandRectPx(
+                        ghost.cx.value, ghost.top.value, ghost.w.value.coerceAtLeast(1f), ghost.h.value.coerceAtLeast(1f),
+                        ghost.r.value.coerceIn(0f, minOf(ghost.w.value, ghost.h.value) / 2f)
+                    )
+                    else -> null
+                }
+            }.collect { IslandController.setBlurFrame(it) }
+        } finally {
+            IslandController.setBlurFrame(null)
         }
     }
 
     val blurMax = with(density) { motion.blurDp.coerceIn(0f, 40f).dp.toPx() }
+    // Card fill over the blur: black tint at the chosen opacity. Without real blur: dark translucent.
+    // Solid: plain black. A pill (cardness 0) is always opaque black, so the blur shows in with the card.
+    val cardFill = when {
+        look.solid -> IslandSpec.Fill
+        blurState.real -> Color(0xFF0E0E10).copy(alpha = look.tint.coerceIn(0f, 1f))
+        else -> CardFallbackFill
+    }
+    val glowColor = when ((bubble ?: shownBubble)?.kind) {
+        BubbleKind.TIMER, BubbleKind.STOPWATCH -> IslandSpec.TimerBlue
+        BubbleKind.RECORDER -> IslandSpec.RecRed
+        BubbleKind.CALL, BubbleKind.INCOMING -> IslandSpec.CallGreen
+        BubbleKind.MUSIC -> media?.accent ?: IslandSpec.MusicGreen
+        null -> IslandSpec.TimerBlue
+    }
 
     Box(Modifier.fillMaxSize()) {
-        // Bubble first: it sits behind the pill, so it can split out of the pill's side.
+        // Soft glow behind the bubble.
+        Canvas(Modifier.fillMaxSize()) {
+            val a = glow.value * bAnim.alpha.value
+            if (a > 0.01f) {
+                val s = bAnim.size.value
+                val c = Offset(bAnim.cx.value, bAnim.top.value + s / 2f)
+                val r = s / 2f + 7.dp.toPx()
+                drawCircle(
+                    brush = Brush.radialGradient(
+                        0f to glowColor.copy(alpha = 0.55f * a),
+                        (s / 2f / r) to glowColor.copy(alpha = 0.38f * a),
+                        1f to Color.Transparent,
+                        center = c,
+                        radius = r
+                    ),
+                    radius = r,
+                    center = c
+                )
+            }
+        }
+
+        // Bubble: it sits behind the pill, so it can split out of the pill's side.
         Box(
             Modifier
                 .layout { measurable, _ ->
@@ -559,6 +757,60 @@ fun IslandOverlay(
             }
         }
 
+        // Liquid swap ghost: the old main shrinking into the bubble slot (old content out, bubble content in).
+        val gi = swapping
+        if (gi != null) {
+            Box(
+                Modifier
+                    .layout { measurable, _ ->
+                        val wPx = ghost.w.value.coerceAtLeast(0f).roundToInt()
+                        val hPx = ghost.h.value.coerceAtLeast(0f).roundToInt()
+                        val placeable = measurable.measure(Constraints.fixed(wPx, hPx))
+                        layout(wPx, hPx) { placeable.place(0, 0) }
+                    }
+                    .graphicsLayer {
+                        val w = ghost.w.value.coerceAtLeast(0f)
+                        val h = ghost.h.value.coerceAtLeast(0f)
+                        translationX = ghost.cx.value - w / 2f
+                        translationY = ghost.top.value
+                        shape = RoundedCornerShape(ghost.r.value.coerceIn(0f, minOf(w, h) / 2f))
+                        clip = true
+                    }
+                    .drawBehind {
+                        drawRect(lerp(IslandSpec.Fill, cardFill, ghost.cardness.value.coerceIn(0f, 1f)))
+                    }
+            ) {
+                ContentLayer(gi.fromPlan.main, Alignment.TopCenter, Modifier.graphicsLayer {
+                    transformOrigin = TransformOrigin(0.5f, 0f)
+                    val k = (ghost.w.value / gi.fromPlan.main.w.coerceAtLeast(1f)).coerceIn(0.2f, 3f)
+                    scaleX = k
+                    scaleY = k
+                    val o = ghost.oldContent.value.coerceIn(0f, 1f)
+                    alpha = o
+                    val b = blurMax * 0.7f * (1f - o)
+                    renderEffect = if (b > 0.5f) BlurEffect(b, b, TileMode.Decal) else null
+                }) {
+                    CompositionLocalProvider(
+                        LocalPillFrame provides gi.fromPlan.frame,
+                        LocalMockStopwatch provides gi.stopwatch
+                    ) {
+                        ModeContent(gi.mode, gi.live, media, mockSeconds)
+                    }
+                }
+                Box(
+                    Modifier
+                        .fillMaxSize()
+                        .graphicsLayer {
+                            val n = ghost.newContent.value.coerceIn(0f, 1f)
+                            alpha = n
+                            val b = blurMax * 0.6f * (1f - n)
+                            renderEffect = if (b > 0.5f) BlurEffect(b, b, TileMode.Decal) else null
+                        },
+                    contentAlignment = Alignment.Center
+                ) { BubbleContent(gi.bubble, media, mockSeconds) }
+            }
+        }
+
         Box(
             Modifier
                 .layout { measurable, _ ->
@@ -580,68 +832,126 @@ fun IslandOverlay(
                     clip = true
                 }
                 .drawBehind {
-                    val cardFill = lerp(CardFallbackFill, CardBlurTint, blurMix.value.coerceIn(0f, 1f))
                     drawRect(lerp(IslandSpec.Fill, cardFill, anim.cardness.value.coerceIn(0f, 1f)))
                 }
         ) {
-            val m = morph
-            if (m != null) {
-                // The old content: stretched with the shape, melting away.
-                ContentLayer(m.fromPlan.main, Alignment.TopCenter, Modifier.graphicsLayer {
-                    transformOrigin = TransformOrigin(0.5f, 0f)
-                    val k = (anim.w.value / m.fromW.coerceAtLeast(1f)).coerceIn(0.25f, 3f)
-                    scaleX = k
-                    scaleY = k
-                    alpha = (1f - anim.fade.value).coerceIn(0f, 1f)
-                    val p = morphProgress(m, anim)
-                    val b = blurMax * 0.7f * p * sqrt(p)
-                    renderEffect = if (b > 0.5f) BlurEffect(b, b, TileMode.Decal) else null
-                }) {
-                    CompositionLocalProvider(LocalPillFrame provides m.fromPlan.frame) {
-                        ModeContent(m.from, live, media, mockSeconds)
-                    }
-                }
-            }
-            val shownPlan = if (displayedMode == mode) livePlan else IslandLayout.plan(
-                displayedMode, geometry, calibration, d,
-                pillSlots(displayedMode, live, mockSeconds, textMeasurer, d),
-                withBubble(displayedMode, bubble)
-            )
-            val rect = shownPlan.main
-            val cardContent = displayedMode.isCard()
-            ContentLayer(
-                rect,
-                if (m != null) Alignment.TopCenter else Alignment.Center,
-                Modifier.graphicsLayer {
-                    val mm = morph
-                    if (mm != null) {
-                        // The new content grows out of the old one with the shape, out of blur.
+            CompositionLocalProvider(LocalMockStopwatch provides mockStopwatch) {
+                val m = morph
+                if (m != null) {
+                    // The old content: stretched with the shape, melting away.
+                    ContentLayer(m.fromPlan.main, Alignment.TopCenter, Modifier.graphicsLayer {
                         transformOrigin = TransformOrigin(0.5f, 0f)
-                        val k = (anim.w.value / mm.toW.coerceAtLeast(1f)).coerceIn(0.25f, 3f)
+                        val k = (anim.w.value / m.fromW.coerceAtLeast(1f)).coerceIn(0.25f, 3f)
                         scaleX = k
                         scaleY = k
-                        alpha = anim.fade.value.coerceIn(0f, 1f)
-                        val rest = 1f - morphProgress(mm, anim)
-                        val b = blurMax * rest * sqrt(rest)
+                        alpha = (1f - anim.fade.value).coerceIn(0f, 1f)
+                        val p = morphProgress(m, anim)
+                        val b = blurMax * 0.7f * p * sqrt(p)
                         renderEffect = if (b > 0.5f) BlurEffect(b, b, TileMode.Decal) else null
-                    } else {
-                        transformOrigin = TransformOrigin.Center
-                        // Cards: content grows with the shape, gently clamped. Pills: content keeps its size.
-                        val fit = if (cardContent && rect.w > 1f)
-                            (anim.w.value / rect.w).coerceIn(0.85f, 1.02f) else 1f
-                        alpha = anim.contentAlpha.value
-                        val s = anim.contentScale.value * fit
-                        scaleX = s
-                        scaleY = s
-                        val b = anim.contentBlur.value
-                        renderEffect = if (b > 0.5f) BlurEffect(b, b, TileMode.Decal) else null
+                    }) {
+                        CompositionLocalProvider(LocalPillFrame provides m.fromPlan.frame) {
+                            ModeContent(m.from, live, media, mockSeconds)
+                        }
                     }
                 }
-            ) {
-                CompositionLocalProvider(LocalPillFrame provides shownPlan.frame) {
-                    ModeContent(displayedMode, live, media, mockSeconds)
+                val shownPlan = if (displayedMode == mode) livePlan else IslandLayout.plan(
+                    displayedMode, geometry, calibration, d,
+                    pillSlots(displayedMode, live, mockSeconds, textMeasurer, d, geometry, calibration, stopwatchNow),
+                    withBubble(displayedMode, bubble),
+                    stopwatchNow
+                )
+                val rect = shownPlan.main
+                val cardContent = displayedMode.isCard()
+                val swapGrow = swapping != null
+                ContentLayer(
+                    rect,
+                    if (m != null || swapGrow) Alignment.TopCenter else Alignment.Center,
+                    Modifier.graphicsLayer {
+                        val mm = morph
+                        if (mm != null) {
+                            // The new content grows out of the old one with the shape, out of blur.
+                            transformOrigin = TransformOrigin(0.5f, 0f)
+                            val k = (anim.w.value / mm.toW.coerceAtLeast(1f)).coerceIn(0.25f, 3f)
+                            scaleX = k
+                            scaleY = k
+                            alpha = anim.fade.value.coerceIn(0f, 1f)
+                            val rest = 1f - morphProgress(mm, anim)
+                            val b = blurMax * rest * sqrt(rest)
+                            renderEffect = if (b > 0.5f) BlurEffect(b, b, TileMode.Decal) else null
+                        } else if (swapGrow) {
+                            // Liquid swap: the content grows with the shape out of the bubble, out of blur.
+                            transformOrigin = TransformOrigin(0.5f, 0f)
+                            val k = (anim.w.value / rect.w.coerceAtLeast(1f)).coerceIn(0.2f, 1.05f)
+                            scaleX = k
+                            scaleY = k
+                            alpha = anim.contentAlpha.value
+                            val b = anim.contentBlur.value / blurPx.coerceAtLeast(0.1f) * blurMax * 0.7f
+                            renderEffect = if (b > 0.5f) BlurEffect(b, b, TileMode.Decal) else null
+                        } else {
+                            transformOrigin = TransformOrigin.Center
+                            // Cards: content grows with the shape, gently clamped. Pills: content keeps its size.
+                            val fit = if (cardContent && rect.w > 1f)
+                                (anim.w.value / rect.w).coerceIn(0.85f, 1.02f) else 1f
+                            alpha = anim.contentAlpha.value
+                            val s = anim.contentScale.value * fit
+                            scaleX = s
+                            scaleY = s
+                            val b = anim.contentBlur.value
+                            renderEffect = if (b > 0.5f) BlurEffect(b, b, TileMode.Decal) else null
+                        }
+                    }
+                ) {
+                    CompositionLocalProvider(LocalPillFrame provides shownPlan.frame) {
+                        ModeContent(displayedMode, live, media, mockSeconds)
+                    }
                 }
             }
+        }
+    }
+}
+
+/** Two small pills (or two cards): switching between them is a plain resize, no contraction step. */
+private fun sameFamily(a: IslandMode, b: IslandMode): Boolean {
+    fun small(m: IslandMode) = m != IslandMode.HIDDEN && m != IslandMode.WIDE && !m.isCard()
+    return small(a) && small(b)
+}
+
+/** What the swap ghost shows (the old main content and the bubble it turns into). */
+private data class GhostInfo(
+    val mode: IslandMode,
+    val stopwatch: Boolean,
+    val live: IslandLive?,
+    val bubble: IslandBubble,
+    val fromPlan: IslandPlan
+)
+
+/** The shape that shrinks from the old main into the bubble slot during a liquid swap. */
+private class GhostAnim {
+    val cx = Animatable(0f)
+    val top = Animatable(0f)
+    val w = Animatable(0f)
+    val h = Animatable(0f)
+    val r = Animatable(0f)
+    val cardness = Animatable(0f)
+    val oldContent = Animatable(1f)
+    val newContent = Animatable(0f)
+
+    suspend fun snap(t: IslandRectPx, card: Float) {
+        cx.snapTo(t.cx)
+        top.snapTo(t.top)
+        w.snapTo(t.w)
+        h.snapTo(t.h)
+        r.snapTo(t.r)
+        cardness.snapTo(card)
+    }
+
+    suspend fun animateTo(t: IslandRectPx, spec: AnimationSpec<Float>) {
+        coroutineScope {
+            launch { cx.animateTo(t.cx, spec) }
+            launch { top.animateTo(t.top, spec) }
+            launch { w.animateTo(t.w, spec) }
+            launch { h.animateTo(t.h, spec) }
+            launch { r.animateTo(t.r, spec) }
         }
     }
 }
@@ -701,11 +1011,13 @@ private fun formatClock(totalSeconds: Int): String {
 
 private val DigitsStyle = TextStyle(fontFeatureSettings = "tnum")
 
-/** Time in the small pills: white, semibold, about the status-bar clock size (Xiaomi refs). */
-private val PillTimeSize = 15.sp
+/** Icon size of the pill being drawn (its type's Layout value, else [default]). */
+@Composable
+private fun pillIconDp(default: Float): Dp = (LocalPillFrame.current?.iconDp ?: default).dp
 
-/** "Incoming call" text size in the long incoming pill. */
-private val IncomingTextSize = 12.5.sp
+/** Time / text size of the pill being drawn (its type's Layout value, else [default]). */
+@Composable
+private fun pillTextSp(default: Float): TextUnit = (LocalPillFrame.current?.textSp ?: default).sp
 
 /** The live time a counter pill shows on the right of the camera (null for non-counter modes). */
 private fun pillTimeText(mode: IslandMode, live: IslandLive?, mockSeconds: Int): String? {
@@ -718,8 +1030,11 @@ private fun pillTimeText(mode: IslandMode, live: IslandLive?, mockSeconds: Int):
     }
 }
 
-/** Width of the left-hand icon / waveform of a counter pill. */
-private fun pillLeftDp(mode: IslandMode): Float = if (mode == IslandMode.REC_PILL) 34f else 18f
+/** Width of the left-hand icon / waveform of a counter pill ([iconDp] = icon size / waveform height). */
+private fun pillLeftDp(mode: IslandMode, iconDp: Float): Float = if (mode == IslandMode.REC_PILL) iconDp * 34f / 16f else iconDp
+
+/** Width of the music pill's sound wave for a wave height of [heightDp] (4 bars, 3 dp wide, 2 dp apart at 14 dp). */
+private fun waveWidthDp(heightDp: Float): Float = 18f * heightDp / 14f
 
 /** Wall clock that ticks while the composable is visible (for live timers). */
 @Composable
@@ -828,13 +1143,13 @@ private fun CompactCallContent(live: IslandLive?, mockTime: String) {
     }
     PillSides(
         left = {
-            Icon(Icons.Rounded.Call, null, tint = IslandSpec.CallGreen, modifier = Modifier.size(18.dp))
+            Icon(Icons.Rounded.Call, null, tint = IslandSpec.CallGreen, modifier = Modifier.size(pillIconDp(18f)))
         },
         right = {
             Text(
                 text = right,
                 color = IslandSpec.TextPrimary,
-                fontSize = PillTimeSize,
+                fontSize = pillTextSp(15f),
                 fontWeight = FontWeight.SemiBold,
                 style = DigitsStyle,
                 maxLines = 1,
@@ -866,7 +1181,7 @@ private fun IncomingPillContent() {
             left = {
                 Icon(
                     Icons.Rounded.Call, null, tint = IslandSpec.CallGreen,
-                    modifier = Modifier.size(19.dp).graphicsLayer {
+                    modifier = Modifier.size(pillIconDp(19f)).graphicsLayer {
                         rotationZ = (pulse - 0.5f) * 22f
                     }
                 )
@@ -875,7 +1190,7 @@ private fun IncomingPillContent() {
                 Text(
                     text = "Incoming call",
                     color = IslandSpec.TextPrimary,
-                    fontSize = IncomingTextSize,
+                    fontSize = pillTextSp(12.5f),
                     fontWeight = FontWeight.SemiBold,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
@@ -1116,18 +1431,19 @@ private fun ProgressRingButton(button: IslandButton, sizeDp: Int, fraction: Floa
 @Composable
 private fun TimerPillContent(live: IslandLive?, mockSeconds: Int) {
     val now = rememberNow()
-    val stopwatch = live?.kind == LiveKind.STOPWATCH
+    val stopwatch = live?.kind == LiveKind.STOPWATCH || (live == null && LocalMockStopwatch.current)
     val paused = live?.paused == true
+    val iconSize = pillIconDp(18f)
     PillSides(
         left = {
-            if (stopwatch) AnimatedStopwatch(18.dp, !paused) { live?.elapsedMs() ?: 0L }
-            else AnimatedHourglass(18.dp, !paused)
+            if (stopwatch) AnimatedStopwatch(iconSize, !paused) { live?.elapsedMs() ?: (mockSeconds * 1000L) }
+            else AnimatedHourglass(iconSize, !paused)
         },
         right = {
             Text(
                 text = timerText(live, now, mockSeconds, stopwatch),
                 color = if (paused) IslandSpec.TextSecondary else IslandSpec.TextPrimary,
-                fontSize = PillTimeSize,
+                fontSize = pillTextSp(15f),
                 fontWeight = FontWeight.SemiBold,
                 style = DigitsStyle,
                 maxLines = 1,
@@ -1140,7 +1456,7 @@ private fun TimerPillContent(live: IslandLive?, mockSeconds: Int) {
 @Composable
 private fun TimerCardContent(live: IslandLive?, mockSeconds: Int) {
     val now = rememberNow(200L)
-    val stopwatch = live?.kind == LiveKind.STOPWATCH
+    val stopwatch = live?.kind == LiveKind.STOPWATCH || (live == null && LocalMockStopwatch.current)
     val paused = live?.paused == true
     Row(
         modifier = Modifier.fillMaxSize().padding(start = 20.dp, end = 14.dp),
@@ -1238,13 +1554,14 @@ private fun recText(live: IslandLive?, now: Long, mockTime: String): String =
 private fun RecPillContent(live: IslandLive?, mockTime: String) {
     val now = rememberNow()
     val paused = live?.paused == true
+    val waveH = LocalPillFrame.current?.iconDp ?: 16f
     PillSides(
-        left = { LiveWaveform(34.dp, 16.dp, running = !paused) },
+        left = { LiveWaveform((waveH * 34f / 16f).dp, waveH.dp, running = !paused) },
         right = {
             Text(
                 text = recText(live, now, mockTime),
                 color = if (paused) IslandSpec.TextSecondary else IslandSpec.TextPrimary,
-                fontSize = PillTimeSize,
+                fontSize = pillTextSp(15f),
                 fontWeight = FontWeight.SemiBold,
                 style = DigitsStyle,
                 maxLines = 1,
@@ -1334,7 +1651,7 @@ private fun AlbumArt(art: androidx.compose.ui.graphics.ImageBitmap?, sizeDp: Flo
 
 /** Sound-wave bars; they move only while music is playing. */
 @Composable
-private fun SoundWave(playing: Boolean, color: Color) {
+private fun SoundWave(playing: Boolean, color: Color, heightDp: Float = 14f) {
     val heights = if (playing) {
         val transition = rememberInfiniteTransition(label = "wave")
         listOf(420, 300, 520, 360).mapIndexed { i, period ->
@@ -1352,17 +1669,18 @@ private fun SoundWave(playing: Boolean, color: Color) {
     } else {
         listOf(0.3f, 0.45f, 0.3f, 0.4f)
     }
+    val k = heightDp / 14f
     Row(
-        modifier = Modifier.height(14.dp),
-        horizontalArrangement = Arrangement.spacedBy(2.dp),
+        modifier = Modifier.height(heightDp.dp),
+        horizontalArrangement = Arrangement.spacedBy((2f * k).dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         heights.forEach { h ->
             Box(
                 Modifier
-                    .width(3.dp)
+                    .width((3f * k).dp)
                     .fillMaxHeight(h)
-                    .clip(RoundedCornerShape(1.5.dp))
+                    .clip(RoundedCornerShape((1.5f * k).dp))
                     .background(color)
             )
         }
@@ -1373,9 +1691,11 @@ private fun SoundWave(playing: Boolean, color: Color) {
 private fun CompactMusicContent(media: IslandMediaInfo?) {
     val accent = media?.accent ?: IslandSpec.MusicGreen
     val playing = media?.playing ?: true
+    val frame = LocalPillFrame.current
+    val art = frame?.iconDp ?: 22f
     PillSides(
-        left = { AlbumArt(media?.art, sizeDp = 22f, radiusDp = 6f) },
-        right = { SoundWave(playing = playing, color = accent) }
+        left = { AlbumArt(media?.art, sizeDp = art, radiusDp = 6f * art / 22f) },
+        right = { SoundWave(playing = playing, color = accent, heightDp = frame?.textSp ?: 14f) }
     )
 }
 

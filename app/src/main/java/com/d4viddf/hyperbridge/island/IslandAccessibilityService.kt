@@ -139,6 +139,7 @@ class IslandAccessibilityService : AccessibilityService(), LifecycleOwner, ViewM
         IslandController.setMotion(IslandCalibrationStore.loadMotion(this))
         IslandController.setShowOnLock(IslandCalibrationStore.loadShowOnLock(this))
         IslandController.setIconHide(IslandCalibrationStore.loadIconHide(this))
+        IslandController.setLook(IslandCalibrationStore.loadLook(this))
         IslandMedia.appContext = applicationContext
         IslandController.setServiceRunning(true)
         // Order matters: the blur window must sit BELOW the island's draw window, so add it first.
@@ -186,11 +187,14 @@ class IslandAccessibilityService : AccessibilityService(), LifecycleOwner, ViewM
                 IslandController.mode,
                 IslandController.shownLive,
                 IslandController.iconHide,
-                iconRecheck
-            ) { m, l, prefs, tick ->
+                iconRecheck,
+                IslandController.bubble
+            ) { m, l, prefs, tick, b ->
                 // Only the KIND matters: the live object changes every second (timer / recorder
                 // ticks), which used to cancel the debounce below before the command could run.
-                Pair(m != IslandMode.HIDDEN && prefs.wants(l?.kind ?: m.mockLiveKind()), tick)
+                // "Two activities at once": a second content shown as the bubble beside the pill / card.
+                val two = prefs.multi && b != null
+                Pair(m != IslandMode.HIDDEN && (prefs.wants(l?.kind ?: m.mockLiveKind()) || two), tick)
             }
                 .distinctUntilChanged()
                 .collectLatest { (want, tick) ->
@@ -241,9 +245,18 @@ class IslandAccessibilityService : AccessibilityService(), LifecycleOwner, ViewM
 
     /**
      * A transparent overlay window (via a Dialog, so it has a real Window) placed BELOW the island's
-     * draw window. When a card has settled, it is moved exactly behind the card and gets
-     * Window.setBackgroundBlurRadius with a rounded background, so what's behind the card is
-     * blurred; the card itself then draws a dark tint over it. Hidden (1x1, no blur) otherwise.
+     * draw window, with Window.setBackgroundBlurRadius and a rounded background.
+     *
+     * Phase 4.1 — blur from the first frame: the window is laid out ONCE at the draw window's size and
+     * never resized while animating. The blurred region is the window background (DecorView's
+     * background = blur drawable + our rounded GradientDrawable), whose bounds are the DecorView's own
+     * frame. Every animation frame the overlay publishes the card's current rect; we move the
+     * DecorView's frame (View.setLeft/Top/Right/Bottom — a View property, no window relayout) to it,
+     * so the blur region follows the shape on the same spring, frame by frame. Corner radius changes
+     * re-set the background drawable (cheap, no relayout).
+     *
+     * Fallback ("Blur follow: window"): the old way, resizing the window to the rect each frame —
+     * visible from frame 1 too, but it steps because every resize is a window relayout.
      */
     private fun addBlurWindow() {
         if (blurDialog != null) return
@@ -276,6 +289,11 @@ class IslandAccessibilityService : AccessibilityService(), LifecycleOwner, ViewM
             dlg.setContentView(View(this))
             dlg.show()
             blurDialog = dlg
+            // A layout pass resets the DecorView to the window size; put it back on the current rect.
+            // Runs inside the layout pass, before the frame is drawn, so the region never flashes full-size.
+            w.decorView.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+                if (blurFollowView && blurWindowFull) applyBlurFrame(lastBlurRect)
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to add blur window", e)
             blurDialog = null
@@ -287,6 +305,14 @@ class IslandAccessibilityService : AccessibilityService(), LifecycleOwner, ViewM
         setColor(0x01000000)
         cornerRadius = radius
     }
+
+    /** Current state of the blur window (main thread only). */
+    private var lastBlurRect: IslandRectPx? = null
+    private var blurRadiusPx = -1
+    private var blurCornerPx = -1f
+    private var blurWindowFull = false
+    private var blurWindowHeight = 0
+    private var blurFollowView = true
 
     private fun startBlur() {
         val wm = windowManager ?: return
@@ -311,31 +337,110 @@ class IslandAccessibilityService : AccessibilityService(), LifecycleOwner, ViewM
         }
         blurJob?.cancel()
         blurJob = lifecycleScope.launch {
-            IslandController.blurRect.collect { placeBlur(it) }
+            combine(
+                IslandController.blurFrame,
+                IslandController.look,
+                IslandController.geometry
+            ) { r, look, g -> Triple(r, look, g) }
+                .collect { (r, look, g) -> placeBlur(r, look, g) }
         }
     }
 
-    private fun placeBlur(rect: IslandRectPx?) {
+    private fun placeBlur(rect: IslandRectPx?, look: IslandLook, g: IslandGeometry?) {
         val w = blurDialog?.window ?: return
         try {
-            val a = w.attributes
-            if (rect == null) {
-                w.setBackgroundBlurRadius(0)
-                a.x = 0
-                a.y = 0
-                a.width = 1
-                a.height = 1
-            } else {
-                w.setBackgroundDrawable(blurShape(rect.r))
-                w.setBackgroundBlurRadius((28f * resources.displayMetrics.density).roundToInt())
-                a.x = rect.left.roundToInt()
-                a.y = rect.top.roundToInt()
-                a.width = rect.w.roundToInt().coerceAtLeast(1)
-                a.height = rect.h.roundToInt().coerceAtLeast(1)
+            if (blurFollowView != look.blurFollowView) {
+                // Switching technique: start from a clean, hidden window.
+                hideBlur(w)
+                blurFollowView = look.blurFollowView
+                blurWindowFull = false
             }
-            w.attributes = a
+            if (blurFollowView && g != null) {
+                // Laid out ONCE at the draw window's size (with no blur and an empty region), never resized
+                // while a card animates.
+                val h = windowHeightPx(g)
+                if (!blurWindowFull || blurWindowHeight != h) {
+                    lastBlurRect = null
+                    w.attributes = w.attributes.apply {
+                        x = 0
+                        y = 0
+                        width = WindowManager.LayoutParams.MATCH_PARENT
+                        height = h
+                    }
+                    blurWindowFull = true
+                    blurWindowHeight = h
+                    applyBlurFrame(null)
+                }
+            }
+            val radius = (look.blurDp.coerceIn(0f, 80f) * resources.displayMetrics.density).roundToInt()
+            if (rect == null || look.solid || g == null || radius <= 0) {
+                hideBlur(w)
+                return
+            }
+            setCorner(w, rect.r)
+            if (blurFollowView) {
+                lastBlurRect = rect
+                applyBlurFrame(rect)
+            } else {
+                w.attributes = w.attributes.apply {
+                    x = rect.left.roundToInt()
+                    y = rect.top.roundToInt()
+                    width = rect.w.roundToInt().coerceAtLeast(1)
+                    height = rect.h.roundToInt().coerceAtLeast(1)
+                }
+                lastBlurRect = rect
+            }
+            if (blurRadiusPx != radius) {
+                w.setBackgroundBlurRadius(radius)
+                blurRadiusPx = radius
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to place blur window", e)
+        }
+    }
+
+    /** Re-sets the rounded background only when the corner really changed (keeps the blur's corners). */
+    private fun setCorner(w: android.view.Window, r: Float) {
+        if (abs(r - blurCornerPx) < 0.75f) return
+        w.setBackgroundDrawable(blurShape(r))
+        blurCornerPx = r
+        // setBackgroundDrawable rebuilds the decor background; re-apply the blur radius on top of it.
+        if (blurRadiusPx > 0) w.setBackgroundBlurRadius(blurRadiusPx)
+    }
+
+    /** Moves the blur region (the DecorView's frame) to [rect] without relaying out the window. */
+    private fun applyBlurFrame(rect: IslandRectPx?) {
+        val decor = blurDialog?.window?.decorView ?: return
+        if (rect == null) {
+            decor.left = 0; decor.top = 0; decor.right = 0; decor.bottom = 0
+            return
+        }
+        val l = rect.left.roundToInt()
+        val t = rect.top.roundToInt()
+        val r = (rect.left + rect.w).roundToInt().coerceAtLeast(l + 1)
+        val b = (rect.top + rect.h).roundToInt().coerceAtLeast(t + 1)
+        if (decor.left == l && decor.top == t && decor.right == r && decor.bottom == b) return
+        // Order avoids a transient negative size.
+        if (l < decor.right) { decor.left = l; decor.right = r } else { decor.right = r; decor.left = l }
+        if (t < decor.bottom) { decor.top = t; decor.bottom = b } else { decor.bottom = b; decor.top = t }
+        decor.invalidate()
+    }
+
+    private fun hideBlur(w: android.view.Window) {
+        if (blurRadiusPx != 0) {
+            w.setBackgroundBlurRadius(0)
+            blurRadiusPx = 0
+        }
+        lastBlurRect = null
+        applyBlurFrame(null)
+        if (!blurFollowView && w.attributes.width != 1) {
+            // Window-resize fallback: park the window at 1x1.
+            w.attributes = w.attributes.apply {
+                x = 0
+                y = 0
+                width = 1
+                height = 1
+            }
         }
     }
 
@@ -647,13 +752,17 @@ class IslandAccessibilityService : AccessibilityService(), LifecycleOwner, ViewM
         }
     }
 
+    /**
+     * Height of the draw window and of the blur window: the tallest card the Layout screen allows
+     * (0.62 x screen width) below the status bar, plus room for the vertical calibration offset.
+     */
+    private fun windowHeightPx(geometry: IslandGeometry): Int =
+        (geometry.statusBarHeightPx +
+                geometry.screenWidthPx * IslandLayout.MAX_CARD_HEIGHT_RATIO +
+                96f * resources.displayMetrics.density).toInt()
+
     private fun buildParams(geometry: IslandGeometry): WindowManager.LayoutParams {
-        val density = resources.displayMetrics.density
-        // Tallest content is the music card (~0.42 x screen width) below the status bar,
-        // plus room for the vertical calibration offset.
-        val heightPx = (geometry.statusBarHeightPx +
-                geometry.screenWidthPx * IslandLayout.MUSIC_HEIGHT_RATIO +
-                72f * density).toInt()
+        val heightPx = windowHeightPx(geometry)
 
         return WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
